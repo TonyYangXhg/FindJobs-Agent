@@ -34,7 +34,6 @@ DEFAULTS = {
     "temperature": 0.7,
 }
 
-
 def load_llm_config() -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
     if DEFAULT_CONFIG_FILE.exists():

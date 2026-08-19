@@ -264,6 +264,7 @@ class OpenAIClient:
         body: Dict[str, Any] = {
             "model": self.model,
             "messages": [
+                # adjusted_system_prompt是更新后的system prompt
                 {"role": "system", "content": adjusted_system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
@@ -329,6 +330,7 @@ class OpenAIClient:
         raise RuntimeError("LLM 多次重试后仍失败。")
 
 
+# 技能收窄
 class SkillRepository:
     """加载 all_labels.csv，并提供岗位技能候选集合。"""
 
@@ -346,6 +348,7 @@ class SkillRepository:
         for _, row in df.iterrows():
             lv3 = str(row["level_3rd"]).strip()
             tags_raw = str(row["tags"]).split("|_|")
+            # clean_tags形式: ["模型","训练","优化","Python","机器学习","深度学习","PyTorch","TensorFlow","算法","数据结构"]
             clean_tags = [t.strip() for t in tags_raw if t.strip()]
             if not lv3 or not clean_tags:
                 continue
@@ -365,6 +368,13 @@ class SkillRepository:
             score += 0.6
         return score
 
+    """
+    函数作用：给当前这个岗位，从全库技能里筛出一小份相关候选标签（默认最多约 80 个），供后面 LLM 从中挑选，而不是让模型面对全部标签或自由编造。
+    有三路筛选规则：
+        1. 岗位标题、项目名与 level_3rd（技能标签库csv） 做字符串相似度；
+        2. JD（Job Description: 职位描述） 中直接出现的技能；
+        3. 全局常见标签作为兜底。
+    """
     def get_candidate_tags(
         self,
         job_title: str,
@@ -372,16 +382,29 @@ class SkillRepository:
         special_program: str,
         limit: int = 80,
     ) -> List[str]:
+
+        # 岗位标题 + 特殊项目/序列（爬虫字段）
         combined = f"{job_title or ''} {special_program or ''}"
         level_scores: List[Tuple[float, str]] = []
         for level_name in self.level_to_tags:
+            # 调用相似度算法
             score = self._level_similarity(combined, level_name)
             if score > 0.32:
                 level_scores.append((score, level_name))
+
+        # level_scores 里是 (分数, 类名)，已按分数降序排好。
         level_scores.sort(reverse=True)
+        # level_scores[:self.max_level_candidates]：只取前 N 个（默认 N=12）
+        # for _, lvl：不要分数 _，只要类名 lvl
+        # 得到：["机器学习工程师", "深度学习工程师", ...] 这类字符串列表
         selected_levels = [lvl for _, lvl in level_scores[: self.max_level_candidates]]
 
         candidates: List[str] = []
+
+        # selected_levels = ["机器学习工程师", "算法研究员"]
+        # level_to_tags["机器学习工程师"] = ["Python", "PyTorch", "推荐系统"]
+        # level_to_tags["算法研究员"]     = ["算法", "研究", "Python"]
+        # candidates → ["Python", "PyTorch", "推荐系统", "算法", "研究", "Python"]
         for lvl in selected_levels:
             candidates.extend(self.level_to_tags.get(lvl, []))
 
@@ -392,10 +415,12 @@ class SkillRepository:
         for tag in self.all_tags:
             if hit_counter >= 40:
                 break
+            # JD 写 “熟悉 PyTorch 与 Redis”，库里有 PyTorch、Redis → 都进 direct_hits
             if tag.lower() in text_norm:
                 direct_hits.append(tag)
                 hit_counter += 1
 
+        # 三路合并
         combined_list = candidates + direct_hits + self.global_fallback_tags
         deduped = deduplicate(combined_list)
         if len(deduped) < limit:
@@ -421,7 +446,10 @@ class Level2Entry:
     keywords: List[str]
     description: str
 
-
+"""
+岗位分析里的外部知识增强模块：当 JD 里出现「旗舰计划 / Top Seed / XX Lab」这类名字时，
+去网上(DuckduckGO)查一点背景，塞进 Prompt，帮 LLM 理解这是什么档次的岗位。
+"""
 class KnowledgeRetriever:
     """检索 program/计划 名称的背景信息，并缓存结果"""
 
@@ -445,6 +473,19 @@ class KnowledgeRetriever:
         except Exception as e:
             logging.warning(f"保存 program cache 失败: {e}")
 
+    """
+    流程：
+    1、优先读缓存
+    2、缓存没有则查 DuckDuckGo
+    3、提取摘要并写缓存
+    
+    输出：
+    program_contexts = {
+        "Top Seed": "面向顶尖技术人才的专项招聘计划……",
+        "Tencent AI Lab": "腾讯旗下人工智能研究实验室……"
+    }
+    """
+    # 优先读缓存，缓存没有则查duckduckgo
     def lookup(self, term: str) -> str:
         term_key = term.strip()
         if not term_key:
@@ -488,17 +529,51 @@ class KnowledgeRetriever:
             logging.debug(f"DuckDuckGo 检索失败: {err}")
             return ""
 
-
+"""
+规则版岗位强度评估器：不调 LLM，用正则扫 JD，判断这个岗有多「硬」，
+并给出技能评分基准，同时抽出计划名给 KnowledgeRetriever。
+"""
 class JobSignalAnalyzer:
     """基于通用信号识别岗位强度"""
 
     def __init__(self):
         self.rule_patterns = []
         for rule in SIGNAL_RULES:
+            # 字符串正则提前编译成正则对象，方便后面反复匹配
             compiled = [re.compile(pat, re.IGNORECASE) for pat in rule["patterns"]]
             self.rule_patterns.append({**rule, "compiled": compiled})
 
+    """
+    JobSignalAnalyzer主方法
+    不调用 LLM，而是用预先配置的正则规则判断岗位是不是高门槛岗位
+    输入：
+       job = {
+            "job_title": "大模型算法研究员",
+            "job_description": "负责复杂推理和多模态大模型研究",
+            "job_requirements": "博士学历，有 NeurIPS 论文优先",
+            "special_program": "Top Seed"
+       }
+    输出：
+        strength_info = {
+            "score": 12,
+            "level": "flagship_research",
+            "level_description": "旗舰科研岗",
+            "base_score": 5,
+            "signals": [
+                Signal(label="博士学位", weight=4, ...),
+                Signal(label="旗舰/人才计划", weight=3, ...),
+                Signal(label="顶级会议/科研成果", weight=3, ...)
+            ],
+            "program_terms": ["Top Seed"]
+        }
+    
+    两个下游用途：
+        注入主 Prompt，告诉 LLM 该岗位的技能评分基准；
+        触发 SkillReviewAgent，对高门槛岗位的低分技能进行二次复核
+    用确定性规则识别岗位门槛，避免高强度岗位被 LLM 低估。
+    """
     def analyze(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        # 将岗位 标题 + 描述 + 任职要求 + special_program 拼成一大段 text。
         text = " ".join(
             [
                 str(job.get("job_title", "")),
@@ -510,6 +585,12 @@ class JobSignalAnalyzer:
         signals: List[Signal] = []
         total_score = 0
 
+        """
+        逐条规则匹配
+        每条规则命中一次就：
+            记一个 Signal（标签、影响说明、权重）
+            total_score += weight
+        """
         for rule in self.rule_patterns:
             if any(pattern.search(text) for pattern in rule["compiled"]):
                 signal = Signal(
@@ -521,7 +602,9 @@ class JobSignalAnalyzer:
                 signals.append(signal)
                 total_score += rule["weight"]
 
+        # 定强度等级
         intensity = self._determine_intensity(total_score)
+        # 抽出计划名
         program_terms = self._extract_program_terms(job, text)
 
         return {
@@ -539,6 +622,12 @@ class JobSignalAnalyzer:
                 return level
         return INTENSITY_LEVELS[-1]
 
+    """
+    抽出计划名：
+        加上 special_program（如 WXG）
+        再用 PROGRAM_TERM_PATTERNS 从正文抠 Top Seed、XX Lab、XX Program 等
+    这些词交给 KnowledgeRetriever 去查背景
+    """
     def _extract_program_terms(self, job: Dict[str, Any], text: str) -> List[str]:
         terms = set()
         special = str(job.get("special_program", "")).strip()
@@ -554,7 +643,12 @@ class JobSignalAnalyzer:
 
         return sorted(terms)
 
-
+"""
+LLM 技能输出后的清洗器：把模型吐出来的「技能名 + 分数」再整理一遍，重点处理 太泛、没信息量的技能词
+LLM 有时会输出这类技能：AI、人工智能、技术、计算机
+这些词太宽，对匹配、筛选几乎没用。
+SkillNormalizer 负责：能换成更具体的标签就换，换不了就丢掉
+"""
 class SkillNormalizer:
     """对模型输出的技能进行归一化和泛化词替换"""
 
@@ -564,6 +658,7 @@ class SkillNormalizer:
         skills: List[Tuple[str, int]],
         candidate_tags: List[str],
     ) -> List[Tuple[str, int]]:
+
         normalized: List[Tuple[str, int]] = []
         seen: set = set()
         for name, score in skills:
@@ -592,13 +687,24 @@ class SkillNormalizer:
         return name
 
 
+############################################# Agent ###################################################
+
 REVIEW_SYSTEM_PROMPT = (
     "你是一名资深的技能评审官，专门针对高强度岗位的技能评分进行复核。"
     "当岗位需求明确包含博士、旗舰计划、顶会成果等信号时，核心技能应达到 4-5 分。"
     "如果评分偏低，请根据信号给出更合理的分数。输出格式：`技能:分数`，仅输出需要调整的技能。"
 )
 
+"""
+岗位分析流水线里的二次复核模块：高强度岗位若核心技能被打低了，再调一次 LLM 尝试抬分。只在必要时触发，失败则保持原分。
 
+前面主 LLM 已经打过一轮技能分，但高门槛岗（博士、旗舰计划、顶会等）有时仍会被低估，例如：
+岗是科研/旗舰档，但 PyTorch 只给了 2 分
+信号很明显，技能分和岗位强度对不上
+JobSignalAnalyzer 只能给出 base_score 基准；SkillReviewAgent 负责：对低于基准的技能再审一遍，只上调、不下调。
+
+只有 base_score > 3（科研型 4 分、旗舰科研 5 分）才可能复核。
+"""
 class SkillReviewAgent:
     """根据岗位强度再次审查技能评分"""
 
@@ -612,10 +718,12 @@ class SkillReviewAgent:
         skills: List[Tuple[str, int]],
         parse_fn,
     ) -> List[Tuple[str, int]]:
+
         base_score = strength_info.get("base_score", 3)
         if base_score <= 3:
             return skills
 
+        # 筛选出低于基准分的
         flagged = [(name, score) for name, score in skills if score < base_score]
         if not flagged:
             return skills
@@ -646,6 +754,7 @@ class SkillReviewAgent:
         adjustment_map = dict(adjustments)
         updated = []
         for name, score in skills:
+            # 只接受上调：新分必须 > 旧分
             if name in adjustment_map and adjustment_map[name] > score:
                 updated.append((name, adjustment_map[name]))
             else:
@@ -823,6 +932,51 @@ class TaxonomyManager:
         
         raise RuntimeError("多次尝试后仍无法生成合格的岗位族谱。")
 
+    """
+    负责岗位分类体系
+    一级：算法
+        二级：大模型算法、推荐算法、计算机视觉……
+    岗位族举例：
+        一级岗位族：算法
+          ├─ 大模型算法工程师
+          ├─ 推荐算法工程师
+          ├─ 计算机视觉算法工程师
+          └─ 搜索算法工程师
+        
+        一级岗位族：后端
+          ├─ Java后端工程师
+          ├─ Go后端工程师
+          └─ 基础架构工程师
+    
+    流程：
+    1、关键词命中：只要JD中命中某个岗位的关键词时，就加分
+    2、岗位名称相似度：判断完整岗位文本与这个岗位名字的字符相似度
+    3、排序并截断：默认最多取 40 个二级岗位，再按一级岗位族分组，最多保留 4 个一级分类。
+        比如：
+        taxonomy_candidates = [
+            {
+                "level1": "算法",              # 最多保留4个一级岗位
+                "level2_options": [           # 最多保留40个二级岗位
+                    {
+                        "name": "大模型算法工程师",
+                        "keywords": ["大模型", "Transformer", "微调"],
+                        "description": "负责大模型训练和优化"
+                    },
+                    {
+                        "name": "自然语言处理算法工程师",
+                        "keywords": ["NLP", "文本", "语言模型"],
+                        "description": "负责自然语言处理算法研发"
+                    }
+                ]
+            },
+            {
+                "level1": "人工智能平台",
+                "level2_options": [...]
+            }
+    ]
+    
+    核心作用：先用关键词和相似度从岗位族谱中召回候选分类，再让 LLM 做最终分类。
+    """
     def get_candidates(
         self, job_text: str, top_level1: int = 4, max_level2: int = 40
     ) -> List[Dict[str, Any]]:
@@ -912,7 +1066,26 @@ class JobAgent:
         """并行处理所有岗位"""
         total_jobs = len(jobs)
         logging.info(f"🚀 开始并行处理 {total_jobs} 个岗位，使用 {max_workers} 个并行线程...")
+
+        """
+        process_job_wrapper 做三件事：
+            调 _process_single_job()；
+            将分析结果和原岗位合并；
+            单岗失败时返回空分析字段，不中断整批。
         
+        合并方式： {**job, **result}
+        例如原始岗位：
+            {
+                "job_title": "大模型算法工程师",
+                "location": "北京"
+            }
+        分析结果：
+            {
+                "skill_tags": "Python , 4 , AI | PyTorch , 4 , AI",
+                "min_degree": "硕士"
+            }
+        合并后两个部分都会保留。
+        """
         def process_job_wrapper(args):
             """包装函数，用于并行处理单个岗位"""
             idx, job = args
@@ -931,6 +1104,9 @@ class JobAgent:
         completed_count = 0
         
         # 使用线程池并行处理
+        """
+        每个岗位进行一次完整的分析流程：技能收窄->
+        """
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
             future_to_idx = {
@@ -976,6 +1152,7 @@ class JobAgent:
         job_req = job.get("job_requirements", "")
         special_program = job.get("special_program", "")
 
+        # 爬虫统一字段被拼成 job_text，供岗位族匹配、复核等模块使用
         job_text = "\n".join(
             [
                 f"岗位名称: {job_title}",
@@ -989,16 +1166,23 @@ class JobAgent:
             ]
         )
 
+        # 收窄技能，把技能限定在给定范围内，不要让大模型乱发挥
         candidate_tags = self.skill_repo.get_candidate_tags(
             job_title, f"{job_desc}\n{job_req}", special_program
         )
+
+        # 岗位族精选：岗位族谱可能有很多二级岗位，不能全部放进 Prompt，所以先做召回。
         taxonomy_candidates = self.taxonomy_manager.get_candidates(job_text)
 
+        # 计算岗位强度，给出打分和评级：该方法不调用 LLM，而是用预先配置的正则规则判断岗位是不是高门槛岗位。
         strength_info = self.signal_analyzer.analyze(job)
+
+        # 提取出strength_info中的program_terms字段，使用Duckduckgo检索计划背景
         program_contexts = self.knowledge_retriever.lookup_terms(
             strength_info.get("program_terms", [])
         )
 
+        # 主调用
         llm_response = self._call_llm(
             job,
             candidate_tags,
@@ -1006,20 +1190,34 @@ class JobAgent:
             strength_info,
             program_contexts,
         )
+
+        """
+            以下代码总结：
+            把 LLM 的原始 JSON 先解析和规范化，再通过技能白名单、分数裁剪、数量兜底及高强度岗位复核得到可信技能，
+            最后把嵌套结果压平成 CSV 字段，并保留原始 LLM JSON 方便调试。
+        """
+        
+        # 直接 json.loads()；将字符串转成字典，解析失败抛异常，由外层单岗兜底。
         parsed = self._parse_llm_output(llm_response)
+        # 校验字段格式
         validated = self._validate_and_normalize(parsed, job_text)
 
+        # 技能白名单
         skills = self._select_skills(
             validated.get("skills", []),
             candidate_tags,
             strength_info,
         )
+
+        # 二次复审agent：只允许上调
         skills = self.skill_review_agent.review(
             job_text,
             strength_info,
             skills,
             lambda reply, allowed: parse_llm_response(reply, allowed),
         )
+
+        # 转成 CSV 字符串
         skill_string = format_skill_string(skills)
 
         job_family = validated.get("job_family", {}) or {}
@@ -1039,6 +1237,37 @@ class JobAgent:
             "llm_raw_json": json.dumps(parsed, ensure_ascii=False),
         }
 
+    """
+    主调用：负责把收集到的所有数据整合到一块，最后发给llm
+    
+    输入：
+        原始岗位；
+        V4 评分规则；
+        岗位强度；
+        外部检索摘要；
+        候选技能和岗位族；
+        要求的 JSON Schema。
+        
+    输出：
+    {
+      "min_degree": {
+        "degree": "硕士",
+        "priority": "必须"
+      },
+      "major_requirement": {
+        "text": "计算机、人工智能相关专业",
+        "priority": "优先"
+      },
+      "skills": [
+        {"name": "Python", "score": 4},
+        {"name": "PyTorch", "score": 4}
+      ],
+      "job_family": {
+        "level1": "算法",
+        "level2": "大模型算法工程师"
+      }
+    }
+    """
     def _call_llm(
         self,
         job: Dict[str, Any],
@@ -1066,8 +1295,11 @@ class JobAgent:
             "【任职要求】",
             job.get("job_requirements", ""),
         ]
+
         strength_section = self._build_strength_prompt(strength_info)
+
         knowledge_section = self._build_program_context_prompt(program_contexts)
+
         candidate_section = (
             "【候选技能标签】请仅从下列列表中挑选最契合岗位的 3-10 个技能：\n"
             f"{', '.join(candidate_tags)}"
@@ -1140,6 +1372,14 @@ class JobAgent:
             logging.error("LLM 输出无法解析为 JSON：%s", err)
             raise
 
+    """
+    学历限制为大专/本科/硕士/博士；
+    LLM 学历非法时从 JD 原文推断；
+    最终推断不到时默认本科；
+    优先级归一为“必须”或“优先”；
+    专业文本最多 120 字；
+    缺失字段补空值。
+    """
     def _validate_and_normalize(
         self, payload: Dict[str, Any], job_text: str
     ) -> Dict[str, Any]:
@@ -1147,12 +1387,14 @@ class JobAgent:
         degree_value = self._normalize_degree(min_degree.get("degree"), job_text)
         degree_priority = self._normalize_priority(min_degree.get("priority"))
 
+        # 专业要求限制字数，防止 LLM 输出过长的专业说明。
         major_req = payload.get("major_requirement") or {}
         major_priority = self._normalize_priority(major_req.get("priority"))
         major_text = str(major_req.get("text") or "").strip()
         if len(major_text) > 120:
             major_text = major_text[:117] + "..."
 
+        # 岗位族取值
         job_family = payload.get("job_family") or {}
         lvl1 = job_family.get("level1") or ""
         lvl2 = job_family.get("level2") or ""
@@ -1164,24 +1406,50 @@ class JobAgent:
             "job_family": {"level1": lvl1, "level2": lvl2},
         }
 
+    """
+    技能白名单和数量控制
+    三个输入：
+        validated["skills"]：LLM 输出的技能；
+        candidate_tags：之前召回的候选技能；
+        strength_info：岗位强度和基准分。
+    """
     def _select_skills(
         self,
         skills_payload: List[Dict[str, Any]],
         candidate_tags: List[str],
         strength_info: Dict[str, Any],
     ) -> List[Tuple[str, int]]:
+        # 假设 LLM 输出：
+        # [
+        #     {"name": "Python", "score": 4},
+        #     {"name": "PyTorch", "score": 6},
+        #     {"name": "模型炼丹术", "score": 5},
+        #     {"name": "AI", "score": 3},
+        #     {"name": "", "score": 4}
+        # ]
         valid_skills: List[Tuple[str, int]] = []
         for item in skills_payload:
             name = str(item.get("name") or "").strip()
             score = item.get("score")
+            # 下面这些会被删除：
+            # {"name": "", "score": 4}
+            # {"name": "Python", "score": "很重要"}
             if not name or not isinstance(score, (int, float)):
                 continue
+            # 将分数限制在 1～5
+            # 例如：
+            # 6   → 5
+            # 0   → 1
+            # 3.7 → 4
             score_int = max(1, min(5, int(round(score))))
+            # validate_skill() 检查技能是否存在于 all_labels.csv
             if self.skill_repo.validate_skill(name):
                 valid_skills.append((name, score_int))
 
+        # 清理泛化技能, 将过于宽泛的技能换成更具体的候选技能，如：AI → 大模型
         valid_skills = SkillNormalizer.normalize(valid_skills, candidate_tags)
 
+        # 技能数量不足时兜底, 限定至少3个技能，如果不足，则从candidate_tags补足
         if len(valid_skills) < self.min_skill_count:
             logging.warning(
                 "技能数量不足（%s），将使用候选列表兜底。",
@@ -1199,6 +1467,7 @@ class JobAgent:
                 if self.skill_repo.validate_skill(tag):
                     valid_skills.append((tag, fallback_score))
 
+        # 技能过多时截断：最多10个
         if len(valid_skills) > self.max_skill_count:
             valid_skills = valid_skills[: self.max_skill_count]
 
@@ -1295,7 +1564,9 @@ def main() -> None:
     api_manager = APIKeyManager(api_keys)
     llm_client = OpenAIClient(api_manager, model=args.model)
 
+    # 技能候选
     skill_repo = SkillRepository(args.labels_file)
+    # 岗位族候选
     taxonomy_manager = TaxonomyManager(
         args.taxonomy_file, args.user_desc_file, llm_client
     )

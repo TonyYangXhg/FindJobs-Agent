@@ -46,6 +46,7 @@ class APIKeyManager:
     def __init__(self, api_keys: List[str]):
         self.api_keys = api_keys
         self.lock = Lock()
+        # index是轮询指针，记住「下一次该用第几个 key」
         self.current_index = 0
         if not self.api_keys:
             raise ValueError("至少需要提供一个 API key")

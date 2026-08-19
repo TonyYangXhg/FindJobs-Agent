@@ -63,6 +63,8 @@ def apply_temperature_strategy(
     if supports_temperature(model):
         return system_prompt, desired_temperature
 
+    # _temperature_guideline: Make the temperature compatible, define a set of temperature scales using words.
+    # 如果模型不兼容temperature，则改用文字指令「模拟」想要的随机程度，拼写进system prompt中。
     directive = (
         "## Variability Directive\n"
         f"The current model ({model}) ignores the temperature parameter. "

@@ -1,4 +1,4 @@
-from job_matcher import JobMatcher
+from job_matcher import JobMatcher, extract_skills_from_text
 
 
 def test_parse_job_skills_accepts_pipeline_formats():
@@ -127,3 +127,37 @@ def test_fuzzy_match_picks_highest_scoring_resume_skill_not_first():
     assert len(detail) == 1
     assert detail[0]["resume_skill_name"] == "advanced-ml"
     assert detail[0]["resume_score"] == 8
+
+
+def test_extract_skills_from_text_finds_tags_and_avoids_java_in_javascript():
+    vocab = ["JavaScript", "Java", "Python", "Agent", "LLM", "机器学习"]
+    text = "负责 JavaScript 与 Python 开发，搭建 LLM Agent 系统，熟悉机器学习。"
+    skills = extract_skills_from_text(text, vocab)
+    assert "JavaScript" in skills
+    assert "Python" in skills
+    assert "Agent" in skills
+    assert "LLM" in skills
+    assert "机器学习" in skills
+    assert "Java" not in skills
+
+
+def test_extract_skills_skips_generic_chinese_tokens():
+    vocab = ["Agent", "开发", "平台", "系统", "LLM"]
+    skills = extract_skills_from_text("负责 Agent 平台开发与系统设计，使用 LLM", vocab)
+    assert "Agent" in skills
+    assert "LLM" in skills
+    assert "开发" not in skills
+    assert "平台" not in skills
+    assert "系统" not in skills
+
+
+def test_extract_skills_matches_agent_inside_agentruntime():
+    skills = extract_skills_from_text("AgentRuntime高级技术专家", ["Agent", "Go", "Java"])
+    assert skills == ["Agent"]
+
+
+def test_extract_skills_from_text_respects_limit():
+    vocab = ["Transformer", "Python", "LLM"]
+    skills = extract_skills_from_text("Transformer Python LLM", vocab, limit=2)
+    assert len(skills) == 2
+    assert skills[0] == "Transformer"

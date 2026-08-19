@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 logging.basicConfig(level=logging.INFO)
 
@@ -27,6 +28,85 @@ def _normalize_skill_name(name: str) -> str:
 
 def _clean_skill_name(name: str) -> str:
     return name.strip().strip(" -:：()[]{}")
+
+
+# ASCII-like tags (Python, C++, LLM) need token boundaries so "Java" does not
+# match inside "JavaScript". Chinese tags keep substring matching.
+_ASCII_TAG_RE = re.compile(r"^[A-Za-z0-9+#.\-]+(?:\s+[A-Za-z0-9+#.\-]+)*$")
+_GENERIC_SKILL_TAGS = {
+    "模型", "训练", "优化", "系统", "架构", "开发", "设计", "服务", "平台", "团队",
+    "客户", "研究", "创新", "网站", "应用", "项目", "管理", "报告", "分析", "工具",
+    "质量", "保证", "监控", "数据", "产品", "市场", "策略", "推广", "运营", "内容",
+    "用户", "活动", "策划", "执行", "视觉", "风格", "形象", "制作", "工业", "包装",
+    "缺陷", "硬件", "电路", "验证", "物资", "协调", "仓库", "招聘", "战略", "事务",
+    "法律", "合规", "员工", "发展", "业绩", "关系", "维护", "协助", "拓展", "顾问",
+    "支持", "咨询", "解决", "处理", "反馈", "课程", "指导", "框架", "挖掘", "识别",
+    "建模", "统计", "接口", "后端", "前端", "测试", "助理", "销售", "财务", "行政",
+}
+
+
+def load_skill_vocabulary(labels_path: Path) -> List[str]:
+    """Load unique skill names from all_labels.csv (tags column, split by |_|)."""
+    if not labels_path.exists():
+        return []
+    import pandas as pd
+
+    tags: List[str] = []
+    seen = set()
+    df = pd.read_csv(labels_path).fillna("")
+    for raw in df.get("tags", []):
+        for tag in str(raw).split("|_|"):
+            name = _clean_skill_name(tag)
+            key = _normalize_skill_name(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            tags.append(name)
+    tags.sort(key=len, reverse=True)
+    return tags
+
+
+def extract_skills_from_text(
+    text: str,
+    vocabulary: Sequence[str],
+    limit: int = 15,
+) -> List[str]:
+    """Pick vocabulary tags that appear in a job title/description/requirements."""
+    if not text or not vocabulary:
+        return []
+
+    haystack = text.lower()
+    hits: List[str] = []
+    seen = set()
+    for tag in vocabulary:
+        if len(hits) >= limit:
+            break
+        key = _normalize_skill_name(tag)
+        if len(key) < 2 or key in seen or key in _GENERIC_SKILL_TAGS:
+            continue
+        if _ascii_tag_in_text(key, haystack):
+            seen.add(key)
+            hits.append(tag)
+    return hits
+
+
+def _ascii_tag_in_text(tag_lower: str, haystack_lower: str) -> bool:
+    if tag_lower not in haystack_lower:
+        return False
+    if not _ASCII_TAG_RE.match(tag_lower):
+        return True
+    # Short tokens ("Go", "AI") and "Java" need boundaries so they do not
+    # match inside "Google" / "JavaScript". Longer tags may appear as a
+    # camelCase prefix ("Agent" in "AgentRuntime").
+    if len(tag_lower) <= 3 or tag_lower == "java":
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(tag_lower)}(?![A-Za-z0-9])"
+        return re.search(pattern, haystack_lower) is not None
+    return True
+
+
+def format_skill_tags(skills: Iterable[str], score: int = 3, source: str = "AUTO") -> str:
+    """Serialize skill names into the pipeline skill_tags string."""
+    return " | ".join(f"{name} , {score} , {source}" for name in skills if str(name).strip())
 
 
 class JobMatcher:
@@ -163,6 +243,25 @@ class JobMatcher:
             for key, count in ranked[:limit]
         ]
 
+    """
+    两条匹配路径：
+    1、精确匹配：如果岗位技能标准化后，直接存在于简历技能字典，就算精确匹配：
+    2、模糊匹配：如果岗位技能包含简历技能 或者 简历技能包含岗位技能
+        如：
+            岗位：Python
+            简历：Python3
+        可以模糊命中。
+            岗位：Spring
+            简历：Spring Boot
+        也可以命中
+        
+    如果有多个技能都能模糊命中，代码选择简历评分最高的那个，避免结果受到字典顺序影响。
+        岗位：Machine Learning
+        简历：
+        Machine Learning Engineering: 3
+        Machine Learning: 4
+    会选择分数更高的候选技能。
+    """
     def _calculate_match(
         self,
         resume_skills: Dict[str, int],
@@ -183,7 +282,12 @@ class JobMatcher:
             # 精确匹配
             normalized_job_skill = _normalize_skill_name(job_skill_name)
             if normalized_job_skill in resume_skills:
+                # 如果岗位技能标准化后，直接存在于简历技能字典，就算精确匹配：
                 resume_score = resume_skills[normalized_job_skill]
+                """
+                resume_score：候选人对某项技能的熟练程度。
+                job_score：岗位对某项技能的要求强度
+                """
                 matched_skills.append({
                     'skill_name': job_skill_name,
                     'resume_score': resume_score,

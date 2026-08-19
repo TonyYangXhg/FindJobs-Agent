@@ -31,6 +31,10 @@ except ImportError:
     raise
 
 from llm_client import LLMClient
+from job_matcher import (
+    _GENERIC_SKILL_TAGS,
+    extract_skills_from_text,
+)
 
 # 配置
 ROOT_DIR = Path(__file__).resolve().parent
@@ -56,6 +60,12 @@ class ResumeParser:
         # 加载技能标签库与岗位族(level_3rd -> tags)
         self.all_tags = self._load_tags()
         self.level3_list, self.level3_to_tags = self._load_level3_and_tags()
+        # Longer, specific tags first so "机器学习" wins over "学习" / "数据"
+        self.tag_vocab = sorted(
+            (t for t in self.all_tags if t.strip().lower() not in _GENERIC_SKILL_TAGS),
+            key=len,
+            reverse=True,
+        )
         logging.info(f"已加载 {len(self.all_tags)} 个技能标签，{len(self.level3_list)} 个岗位类别(level_3rd)")
     
     def _load_tags(self) -> Set[str]:
@@ -180,36 +190,13 @@ class ResumeParser:
         # 构建简历文本
         profile_text = self._build_profile_text(resume_text, extracted_info)
         
-        # 先选择适合的 level_3rd（最多10个）
-        selected_level3 = self._select_level3_via_llm(profile_text, self.level3_list)
-        logging.info(f"LLM 选择的 level_3rd: {selected_level3}")
+        ranked_level3 = self._rank_level3_for_resume(profile_text)
+        selected_level3 = ranked_level3[:10]
+        logging.info(f"简历命中的 level_3rd: {selected_level3}")
 
-        # 基于 level_3rd 汇总核心标签
-        core_tags: List[str] = []
-        for lv3 in selected_level3:
-            core_tags.extend(self.level3_to_tags.get(lv3, []))
-        # 兜底+常见标签
-        default_common_tags = [
-            "Python", "Java", "JavaScript", "C++", "SQL",
-            "机器学习", "深度学习", "算法", "数据结构",
-            "PyTorch", "TensorFlow", "Docker", "Kubernetes",
-            "NLP", "计算机视觉", "推荐系统"
-        ]
+        candidate_tags = self._build_candidate_tags(profile_text, selected_level3)
+        logging.info(f"待评分技能候选: {candidate_tags}")
 
-        # 结合文本直匹配的标签
-        text_based_tags = self._select_candidate_tags(profile_text)
-
-        # 汇总候选标签（核心优先），去重
-        combined_tags_seq = core_tags + default_common_tags + text_based_tags
-        seen = set()
-        candidate_tags: List[str] = []
-        for t in combined_tags_seq:
-            if t and t not in seen and t in self.all_tags:
-                seen.add(t)
-                candidate_tags.append(t)
-        # 控制数量
-        candidate_tags = candidate_tags[:80]
-        
         if not candidate_tags:
             logging.warning("未找到候选技能标签")
             return []
@@ -235,17 +222,19 @@ class ResumeParser:
         try:
             llm_reply = self._call_llm(system_prompt, user_prompt)
             scored_pairs = parse_llm_response(llm_reply, set(candidate_tags))
-            
-            # 转换为前端需要的格式
-            # 排序：核心标签优先，其次分数降序、再按名称
-            core_set = set(core_tags)
+            text_hits = {t.lower() for t in self._select_candidate_tags(profile_text)}
+            # Keep skills evidenced in the resume; drop leftover 1-point tags
+            # that never appeared in the text (they pull the average to 1.0).
+            evidenced = [
+                (name, score)
+                for name, score in scored_pairs
+                if name.lower() in text_hits or score >= 3
+            ]
+            scored_pairs = evidenced or scored_pairs
+
             scored_pairs_sorted = sorted(
                 scored_pairs,
-                key=lambda x: (
-                    0 if x[0] in core_set else 1,
-                    -x[1],
-                    x[0]
-                )
+                key=lambda x: (-x[1], x[0]),
             )
 
             skills = []
@@ -265,11 +254,36 @@ class ResumeParser:
             logging.error(f"技能评分失败: {e}")
             return []
 
+    def _rank_level3_for_resume(self, profile_text: str) -> List[str]:
+        """Rank job families by how many of their tags actually appear in the resume."""
+        hits = set(t.lower() for t in self._select_candidate_tags(profile_text))
+        if not hits:
+            return []
+        ranked: List[Tuple[int, str]] = []
+        for lv3, tags in self.level3_to_tags.items():
+            score = sum(1 for t in tags if t.lower() in hits)
+            if score:
+                ranked.append((score, lv3))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [lv3 for _, lv3 in ranked]
+
+    def _build_candidate_tags(self, profile_text: str, selected_level3: List[str]) -> List[str]:
+        """Only score skills that actually appear in the resume text."""
+        text_based_tags = self._select_candidate_tags(profile_text)
+        family_keys = set()
+        for lv3 in selected_level3:
+            family_keys.update(t.lower() for t in self.level3_to_tags.get(lv3, []))
+        text_based_tags.sort(
+            key=lambda tag: (0 if tag.lower() in family_keys else 1, -len(tag), tag)
+        )
+        return text_based_tags[:40]
+
     def _select_level3_via_llm(self, profile_text: str, level3_all: List[str]) -> List[str]:
         """让LLM从所有 level_3rd 中选出 <=10 个最契合的岗位类别"""
         if not level3_all:
             return []
-        level3_excerpt = ", ".join(level3_all[:200])  # 控制提示长度
+        # Use resume-ranked families, not CSV alphabetical order (.NET / 4S店...).
+        level3_excerpt = ", ".join(level3_all[:80])
         system_prompt = (
             "你是一位资深的职位画像分析专家。请从给定的岗位类别(level_3rd)列表中，"
             "选出最契合该候选人的最多10个类别。严格只返回逗号分隔的类别名称列表，不要包含其他任何符号或解释。"
@@ -285,13 +299,15 @@ class ResumeParser:
             reply = self._call_llm(system_prompt, user_prompt)
             # 清洗成列表
             reply_clean = reply.replace("\n", " ").replace("，", ",")
+            # 清洗完的parts格式：["AI Agent工程师", "大语言模型工程师", "Python后端开发工程师"]
             parts = [p.strip() for p in reply_clean.split(",") if p.strip()]
+
             # 只保留在完整列表中的合法项
             allowed = set(level3_all)
             selected = []
             for p in parts:
                 if p in allowed and p not in selected:
-                    selected.append(p)
+                    selected.append(p) # selected用于去重，遍历过的元素不能重复添加
                 if len(selected) >= 10:
                     break
             # 如果为空，用简单文本匹配兜底
@@ -303,8 +319,9 @@ class ResumeParser:
                     if lv3 and lv3.lower() in text_norm:
                         selected.append(lv3)
             return selected[:10]
+
         except Exception as e:
-            logging.warning(f"LLM 选择 level_3rd 失败，使用兜底逻辑: {e}")
+            logging.warning(f"LLM 选择 level_3rd 失败，使用简历命中的岗位类别: {e}")
             return level3_all[:5]
     
     def _build_profile_text(self, resume_text: str, extracted_info: Dict[str, Any]) -> str:
@@ -326,29 +343,8 @@ class ResumeParser:
         return "\n".join(lines)
     
     def _select_candidate_tags(self, text: str) -> List[str]:
-        """基于简历文本选择候选技能标签"""
-        text_lower = text.lower()
-        candidates = []
-        
-        # 直接匹配
-        for tag in self.all_tags:
-            if tag.lower() in text_lower:
-                candidates.append(tag)
-                if len(candidates) >= 50:  # 限制数量
-                    break
-        
-        # 如果不够，添加一些常见标签
-        if len(candidates) < 20:
-            common_tags = [
-                "Python", "Java", "JavaScript", "C++", "SQL",
-                "机器学习", "深度学习", "算法", "数据结构",
-                "React", "Vue", "Spring Boot", "Docker", "Kubernetes"
-            ]
-            for tag in common_tags:
-                if tag in self.all_tags and tag not in candidates:
-                    candidates.append(tag)
-        
-        return candidates[:50]  # 最多50个
+        """基于简历文本选择候选技能标签（只保留原文中出现过的具体技能）"""
+        return extract_skills_from_text(text, self.tag_vocab, limit=40)
     
     def _categorize_skill(self, skill_name: str) -> str:
         """对技能进行分类"""

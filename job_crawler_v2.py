@@ -416,46 +416,91 @@ class AlibabaCrawler(JobCrawlerBase):
 
 
 class BaiduCrawler(JobCrawlerBase):
-    """百度"""
+    """百度
+
+    talent.baidu.com 的 getPostListNew 只接受 form-urlencoded，不接受 JSON body；
+    recruitType 取值：GRADUATE / INTERN / SOCIAL（不是 CAMPUS）。
+    """
+
     @property
     def company_name(self) -> str:
         return "百度"
-    
+
     def crawl(self) -> List[Dict]:
         logger.info(f"🚀 {self.company_name}...")
-        for recruit_type in ['SOCIAL', 'CAMPUS']:
+        url = "https://talent.baidu.com/httservice/getPostListNew"
+        # 先访问列表页拿 Cookie（部分环境需要）
+        self._request(
+            "https://talent.baidu.com/jobs/list",
+            headers={**DEFAULT_HEADERS, "Accept": "text/html,application/xhtml+xml"},
+        )
+
+        for recruit_type, category in [
+            ("GRADUATE", "校招"),
+            ("INTERN", "实习"),
+            ("SOCIAL", "社招"),
+        ]:
             if self._should_stop():
                 break
             page = 1
             while not self._should_stop():
-                url = "https://talent.baidu.com/httservice/getPostListNew"
-                payload = {"recruitType": recruit_type, "pageSize": 50, "curPage": page}
-                headers = {**DEFAULT_HEADERS, 'Content-Type': 'application/json'}
-                resp = self._request(url, method='POST', json=payload, headers=headers)
+                headers = {
+                    **DEFAULT_HEADERS,
+                    "Origin": "https://talent.baidu.com",
+                    "Referer": "https://talent.baidu.com/jobs/list",
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+                # 必须用 form，不能用 json=
+                form = {
+                    "recruitType": recruit_type,
+                    "pageSize": "20",
+                    "curPage": str(page),
+                }
+                resp = self._request(url, method="POST", data=form, headers=headers)
                 if not resp:
                     break
                 try:
                     data = resp.json()
-                    posts = data.get('data', {}).get('list', [])
+                    if data.get("status") != "ok":
+                        logger.debug(
+                            f"百度 API recruitType={recruit_type} status={data.get('status')} msg={data.get('message')}"
+                        )
+                        break
+                    posts = (data.get("data") or {}).get("list") or []
                     if not posts:
                         break
                     for post in posts:
                         if self._should_stop():
                             break
-                        self.jobs.append(self._normalize_job({
-                            'job_title': post.get('name', ''),
-                            'job_id': f"BD_{post.get('postId', '')}",
-                            'category': '校招' if recruit_type == 'CAMPUS' else '社招',
-                            'location': post.get('workPlace', ''),
-                            'job_type': post.get('serviceType', ''),
-                            'job_description': post.get('serviceCondition', ''),
-                            'job_requirements': post.get('workContent', ''),
-                            'apply_url': f"https://talent.baidu.com/jobs/detail/{post.get('postId', '')}",
-                        }))
-                    if page * 50 >= data.get('data', {}).get('total', 0):
+                        post_id = post.get("postId") or post.get("jobId") or ""
+                        self.jobs.append(
+                            self._normalize_job(
+                                {
+                                    "job_title": post.get("name", ""),
+                                    "job_id": f"BAIDU_{post_id}",
+                                    "category": category,
+                                    "location": post.get("workPlace", ""),
+                                    "job_type": post.get("postType")
+                                    or post.get("serviceType", ""),
+                                    "special_program": post.get("projectType")
+                                    or post.get("orgName", ""),
+                                    "job_description": post.get("workContent")
+                                    or post.get("serviceCondition", ""),
+                                    "job_requirements": post.get("serviceCondition")
+                                    or post.get("workContent", ""),
+                                    "apply_url": (
+                                        f"https://talent.baidu.com/jobs/detail/"
+                                        f"{recruit_type}/{post_id}"
+                                    ),
+                                }
+                            )
+                        )
+                    total = int((data.get("data") or {}).get("total") or 0)
+                    if page * 20 >= total:
                         break
                     page += 1
-                except:
+                except Exception as e:
+                    logger.debug(f"百度解析失败 recruitType={recruit_type}: {e}")
                     break
         logger.info(f"  └─ {len(self.jobs)} 个")
         return self.jobs
@@ -1323,63 +1368,140 @@ class SenseTimeCrawler(JobCrawlerBase):
 
 
 class ByteDanceAPICrawler(JobCrawlerBase):
-    """字节跳动 - 尝试API"""
+    """字节跳动 - 官方搜索 API（POST + portal-channel）"""
+
+    # channel -> (recruitment_id_list, apply_path)
+    # campus/201=校招正式, campus/202=实习, society/101=社招正式
+    _CHANNELS = [
+        ("campus", ["201"], "campus"),
+        ("campus", ["202"], "campus"),
+        ("society", ["101"], "experienced"),
+    ]
+
     @property
     def company_name(self) -> str:
         return "字节跳动"
-    
+
     def crawl(self) -> List[Dict]:
-        logger.info(f"🚀 {self.company_name} (尝试API)...")
-        # 尝试字节的API
-        offset = 0
-        while not self._should_stop():
-            url = "https://jobs.bytedance.com/api/v1/search/job/posts"
-            params = {'offset': offset, 'limit': 50, 'keyword': ''}
-            resp = self._request(url, params=params)
-            if not resp:
-                # API失败，从文件加载
-                return self._load_from_file()
-            try:
-                data = resp.json()
-                jobs = data.get('data', {}).get('job_post_list', [])
-                if not jobs:
-                    if not self.jobs:
-                        return self._load_from_file()
-                    break
-                for job in jobs:
-                    if self._should_stop():
-                        break
-                    self.jobs.append(self._normalize_job({
-                        'job_title': job.get('title', ''),
-                        'job_id': job.get('id', ''),
-                        'category': job.get('recruit_type', {}).get('name', ''),
-                        'location': job.get('city', {}).get('name', ''),
-                        'job_type': job.get('job_category', {}).get('name', ''),
-                        'job_description': job.get('description', ''),
-                        'job_requirements': job.get('requirement', ''),
-                        'apply_url': f"https://jobs.bytedance.com/position/{job.get('id', '')}",
-                    }))
-                offset += 50
-            except:
-                if not self.jobs:
-                    return self._load_from_file()
+        logger.info(f"🚀 {self.company_name}...")
+        url = "https://jobs.bytedance.com/api/v1/search/job/posts"
+        seen_ids = set()
+
+        for channel, recruit_ids, apply_path in self._CHANNELS:
+            if self._should_stop():
                 break
+            offset = 0
+            while not self._should_stop():
+                headers = {
+                    **DEFAULT_HEADERS,
+                    "Content-Type": "application/json",
+                    "Origin": "https://jobs.bytedance.com",
+                    "Referer": f"https://jobs.bytedance.com/{apply_path}/position",
+                    "portal-channel": channel,
+                    "portal-platform": "pc",
+                    "website-path": channel,
+                }
+                payload = {
+                    "keyword": "",
+                    "limit": 50,
+                    "offset": offset,
+                    "job_category_id_list": [],
+                    "tag_id_list": [],
+                    "location_code_list": [],
+                    "subject_id_list": [],
+                    "recruitment_id_list": recruit_ids,
+                    "portal_type": 2,
+                    "job_function_id_list": [],
+                    "storefront_id_list": [],
+                }
+                resp = self._request(url, method="POST", json=payload, headers=headers)
+                if not resp:
+                    break
+                try:
+                    data = resp.json()
+                    if data.get("code") not in (0, "0", None):
+                        logger.debug(
+                            f"字节 API channel={channel} code={data.get('code')} msg={data.get('message')}"
+                        )
+                        break
+                    jobs = (data.get("data") or {}).get("job_post_list") or []
+                    if not jobs:
+                        break
+                    for job in jobs:
+                        if self._should_stop():
+                            break
+                        job_id = str(job.get("id", "")).strip()
+                        if not job_id or job_id in seen_ids:
+                            continue
+                        seen_ids.add(job_id)
+
+                        recruit = job.get("recruit_type") or {}
+                        city = job.get("city_info") or job.get("city") or {}
+                        if isinstance(city, list):
+                            location = ",".join(
+                                str((c or {}).get("name", "")) for c in city if c
+                            )
+                        elif isinstance(city, dict):
+                            location = str(city.get("name", "") or "")
+                        else:
+                            location = str(city or "")
+
+                        category_obj = job.get("job_category") or {}
+                        category_name = (
+                            category_obj.get("name", "")
+                            if isinstance(category_obj, dict)
+                            else str(category_obj or "")
+                        )
+                        recruit_name = (
+                            recruit.get("name", "")
+                            if isinstance(recruit, dict)
+                            else str(recruit or "")
+                        )
+
+                        self.jobs.append(
+                            self._normalize_job(
+                                {
+                                    "job_title": job.get("title", ""),
+                                    "job_id": f"BDANCE_{job_id}",
+                                    "category": recruit_name or channel,
+                                    "location": location,
+                                    "job_type": category_name,
+                                    "job_description": job.get("description", ""),
+                                    "job_requirements": job.get("requirement", ""),
+                                    "apply_url": (
+                                        f"https://jobs.bytedance.com/{apply_path}/position/"
+                                        f"{job_id}/detail"
+                                    ),
+                                }
+                            )
+                        )
+                    offset += 50
+                    # 防御单 channel 占满限额
+                    if offset >= self.max_jobs:
+                        break
+                except Exception as e:
+                    logger.debug(f"字节解析失败 channel={channel}: {e}")
+                    break
+
+        if not self.jobs:
+            return self._load_from_file()
+
         logger.info(f"  └─ {len(self.jobs)} 个")
         return self.jobs
-    
+
     def _load_from_file(self) -> List[Dict]:
-        """从文件加载"""
-        for fname in ['bytedance_jobs.json', 'bytedance_jobs copy.json']:
+        """从文件加载（API 全失败时的兜底）"""
+        for fname in ["bytedance_jobs.json", "bytedance_jobs copy.json"]:
             fpath = ROOT_DIR / fname
             if fpath.exists():
                 try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
+                    with open(fpath, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    for item in data[:self.max_jobs]:
+                    for item in data[: self.max_jobs]:
                         self.jobs.append(self._normalize_job(item))
                     logger.info(f"  └─ {len(self.jobs)} 个 (从文件)")
                     return self.jobs
-                except:
+                except Exception:
                     pass
         logger.warning("  └─ 0 个")
         return []

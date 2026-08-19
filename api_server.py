@@ -21,7 +21,12 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 from resume_parser import ResumeParser
-from job_matcher import JobMatcher
+from job_matcher import (
+    JobMatcher,
+    extract_skills_from_text,
+    format_skill_tags,
+    load_skill_vocabulary,
+)
 from interview_agent import InterviewAgent
 
 # 配置日志
@@ -49,11 +54,14 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 resume_parser = ResumeParser()
 job_matcher = JobMatcher()
 interview_agent = InterviewAgent()
+_skill_vocabulary: List[str] = load_skill_vocabulary(ROOT_DIR / "all_labels.csv")
+logging.info(f"已加载 {len(_skill_vocabulary)} 个技能词用于岗位技能抽取")
 
-# 内存存储（生产环境应使用数据库）
+# 内存存储（生产环境应使用数据库）；简历额外落盘，避免重启后匹配全部变成 0%
 resumes_store: Dict[str, Dict[str, Any]] = {}
 jobs_store: List[Dict[str, Any]] = []
 interview_sessions: Dict[str, Dict[str, Any]] = {}
+RESUME_STORE_FILE = UPLOAD_FOLDER / "resumes_store.json"
 
 # Regex for valid UUID-style file IDs (path traversal protection)
 _VALID_FILE_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
@@ -66,6 +74,58 @@ def _is_safe_file_id(file_id: str) -> bool:
 
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _load_resumes_from_disk() -> None:
+    if not RESUME_STORE_FILE.exists():
+        return
+    try:
+        payload = json.loads(RESUME_STORE_FILE.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            resumes_store.update(payload)
+            logging.info(f"已从磁盘恢复 {len(payload)} 份简历")
+    except Exception as e:
+        logging.warning(f"恢复简历缓存失败: {e}")
+
+
+def _save_resumes_to_disk() -> None:
+    try:
+        RESUME_STORE_FILE.write_text(
+            json.dumps(resumes_store, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logging.warning(f"保存简历缓存失败: {e}")
+
+
+def _enrich_job_skills(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill required_skills from JD text when LLM skill_tags are missing."""
+    skills = [s for s in (job.get("required_skills") or []) if str(s).strip()]
+    raw = str(job.get("skill_tags_raw") or "")
+    if raw.lower() == "nan":
+        raw = ""
+
+    if not skills and raw:
+        skills = parse_skill_tags(raw)
+
+    if not skills:
+        blob = " ".join(
+            [
+                str(job.get("title") or ""),
+                str(job.get("description") or ""),
+                str(job.get("requirements") or ""),
+            ]
+        )
+        skills = extract_skills_from_text(blob, _skill_vocabulary)
+        if skills:
+            raw = format_skill_tags(skills)
+
+    job["required_skills"] = skills
+    job["skill_tags_raw"] = raw
+    return job
+
+
+_load_resumes_from_disk()
 
 
 @app.route('/api/health', methods=['GET'])
@@ -111,6 +171,7 @@ def upload_resume():
             'skills': result['skills']
         }
         resumes_store[file_id] = resume_data
+        _save_resumes_to_disk()
         
         logging.info(f"简历解析完成: {file_id}")
         
@@ -210,7 +271,7 @@ def get_jobs():
                     'category': str(row.get('category', '')),
                     'requirements': str(row.get('job_requirements', '')),
                 }
-                jobs.append(job)
+                jobs.append(_enrich_job_skills(job))
             
             data_source = "enriched_csv"
             logging.info(f"从智能分析CSV加载了 {len(jobs)} 个岗位（含技能评分）")
@@ -247,7 +308,7 @@ def get_jobs():
                     'category': str(raw.get('category', '')),
                     'requirements': str(raw.get('job_requirements', '')),
                 }
-                jobs.append(job)
+                jobs.append(_enrich_job_skills(job))
             
             # 统计朊技能标签的岗位
             with_skills = sum(1 for j in jobs if j['required_skills'])
@@ -278,7 +339,7 @@ def get_jobs():
                     'apply_url': str(row.get('apply_url', '')),
                     'source_url': str(row.get('source_url', ''))
                 }
-                jobs.append(job)
+                jobs.append(_enrich_job_skills(job))
             
             data_source = "bytedance_csv"
             logging.info(f"从原始CSV加载了 {len(jobs)} 个岗位")
@@ -302,22 +363,7 @@ def get_jobs():
 
 def parse_skill_tags(tag_string: str) -> List[str]:
     """解析技能标签字符串，返回技能名称列表"""
-    if not tag_string or tag_string == 'nan':
-        return []
-    
-    skills = []
-    # 格式: "技能名 %> 分数 , AI | 技能名 %> 分数 , AI"
-    parts = tag_string.split('|')
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        # 提取技能名（第一个逗号前的部分）
-        skill_name = part.split(',')[0].strip()
-        if skill_name:
-            skills.append(skill_name)
-    
-    return skills
+    return [name for name, _score in job_matcher.parse_job_skills(tag_string)]
 
 
 @app.route('/api/jobs/match', methods=['POST'])

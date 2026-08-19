@@ -37,11 +37,18 @@ export default function JobsPage({ onStartInterview }: JobsPageProps) {
           }
         });
       });
-      // 按频率降序排序，只取前50个高频技能
-      const skillsArray = Array.from(skillCountMap.entries())
-        .sort((a, b) => b[1] - a[1]) // 按频率降序
-        .slice(0, 50)
-        .map(([skill]) => skill); // 只取技能名
+
+      // 新兴 AI 关键词优先展示（只要岗位里出现过就置顶）
+      const priorityKeywords = [
+        'Agent', 'AI Agent', 'LLM', 'RAG', 'Prompt Engineering',
+        'LangChain', 'LangGraph', 'MCP', '大语言模型', '智能体',
+      ];
+      const priorityPresent = priorityKeywords.filter(k => skillCountMap.has(k));
+      const remaining = Array.from(skillCountMap.entries())
+        .filter(([skill]) => !priorityPresent.includes(skill))
+        .sort((a, b) => b[1] - a[1])
+        .map(([skill]) => skill);
+      const skillsArray = [...priorityPresent, ...remaining].slice(0, 50);
       setAvailableKeywords(skillsArray);
     } catch (error) {
       console.error('Error loading jobs:', error);
@@ -186,6 +193,26 @@ export default function JobsPage({ onStartInterview }: JobsPageProps) {
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
           <p className="mt-4 text-gray-600">加载岗位信息...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (jobs.length === 0) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center max-w-lg px-6">
+          <h2 className="text-xl font-semibold text-gray-900 mb-2">暂无岗位数据</h2>
+          <p className="text-gray-600 mb-4">
+            请确认后端已启动（端口 5000），且项目根目录存在
+            <code className="mx-1 text-sm bg-gray-100 px-1 rounded">all_companies_jobs.json</code>
+            或
+            <code className="mx-1 text-sm bg-gray-100 px-1 rounded">jobs_enriched.csv</code>。
+          </p>
+          <p className="text-gray-500 text-sm">
+            可运行 <code className="bg-gray-100 px-1 rounded">python scripts/bootstrap_sample_data.py</code> 生成示例数据，
+            或运行 <code className="bg-gray-100 px-1 rounded">python pipeline.py</code> 爬取真实岗位。
+          </p>
         </div>
       </div>
     );
