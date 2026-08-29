@@ -54,7 +54,8 @@ export async function simulateResumeUpload(file: File): Promise<UploadResumeResp
 }
 
 export async function getJobs(): Promise<JobPosition[]> {
-  const response = await fetch(`${API_BASE}/jobs`);
+  // 前端仍做全量筛选/展示 description，走 ?all=1；压测默认路径为分页裁剪
+  const response = await fetch(`${API_BASE}/jobs?all=1`);
   const data = await readJson<JobsResponse>(response);
   return data.jobs;
 }
@@ -63,7 +64,8 @@ export async function simulateJobMatching(resumeId: string): Promise<JobMatch[]>
   const response = await fetch(`${API_BASE}/jobs/match`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ resume_id: resumeId }),
+    // 上限 100，便于列表页按匹配分排序；API 默认 top_k=20 供压测/轻量调用
+    body: JSON.stringify({ resume_id: resumeId, top_k: 100 }),
   });
   const data = await readJson<JobMatchResponse>(response);
   return data.matches;
