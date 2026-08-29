@@ -272,7 +272,7 @@ def _parse_jobs_file(path: Path, source: str) -> List[Dict[str, Any]]:
         return _parse_jobs_from_bytedance_csv(path)
     return []
 
-
+# 更新缓存
 def _sync_jobs_store(jobs: List[Dict[str, Any]]) -> None:
     """在持锁状态下同步 jobs_store 与缓存列表。"""
     jobs_store.clear()
@@ -281,12 +281,13 @@ def _sync_jobs_store(jobs: List[Dict[str, Any]]) -> None:
 
 def _ensure_jobs_loaded() -> Tuple[List[Dict[str, Any]], str]:
     """
-    按数据文件 mtime 加载/复用岗位缓存，并同步 jobs_store。
+    按数据文件 mtime 加载 /复用岗位缓存，并同步 jobs_store。
     必须在短临界区内完成读缓存 / 写缓存 / 写 jobs_store。
     """
     global _jobs_cache, _jobs_cache_mtime, _jobs_cache_source, _jobs_cache_path
 
     with _jobs_lock:
+        # 加载工作信息文件
         path, source = _resolve_jobs_data_file()
         if path is None:
             _jobs_cache = []
@@ -295,10 +296,11 @@ def _ensure_jobs_loaded() -> Tuple[List[Dict[str, Any]], str]:
             _jobs_cache_path = None
             _sync_jobs_store([])
             return [], "none"
-
+        # 当前这次请求里，刚从磁盘查到的文件修改时间
         mtime = path.stat().st_mtime
         if (
             _jobs_cache
+            # 磁盘上这份岗位文件现在的修改时间 vs 上次装进缓存时记下的修改时间，如果不一致则更新缓存_jobs_cache_mtime
             and _jobs_cache_mtime == mtime
             and _jobs_cache_source == source
             and _jobs_cache_path == path
@@ -306,8 +308,10 @@ def _ensure_jobs_loaded() -> Tuple[List[Dict[str, Any]], str]:
             return _jobs_cache, source
 
         logging.info(f"从数据文件加载岗位: {path} (source={source})")
+        # 解析缓存
         jobs = _parse_jobs_file(path, source)
         _jobs_cache = jobs
+        # _jobs_cache_mtime：上次把岗位装进 _jobs_cache 时，记下的那个修改时间
         _jobs_cache_mtime = mtime
         _jobs_cache_source = source
         _jobs_cache_path = path

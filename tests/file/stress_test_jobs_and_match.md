@@ -281,19 +281,19 @@ locust -f test\locustfile.py --host http://127.0.0.1:5000 `
 
 Figure 1.1 优化前 user=1
 
-![](./../pic/stress_1_优化后.png)
+![](../pic/jobs_and_match/stress_1_优化后.png)
 
 Figure 1.2 优化前 user=1
 
-![stress_2_优化后](./../pic/stress_2_优化后.png)
+![stress_2_优化后](../pic/jobs_and_match/stress_2_优化后.png)
 
 Figure 2.1 优化后 user=10
 
-![](./../pic/stress_1_优化后_user_10.png)
+![](../pic/jobs_and_match/stress_1_优化后_user_10.png)
 
 Figure 2.2 优化后 user=10
 
-![](./../pic/stress_2_优化后_user_10.png)
+![](../pic/jobs_and_match/stress_2_优化后_user_10.png)
 
 
 
