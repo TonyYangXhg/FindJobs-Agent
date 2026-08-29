@@ -84,18 +84,21 @@
 
 ## 对比表模板（P5 填写）
 
+> 优化前：2026-08-29 Locust（1u CSV + 5u UI）。1u：upload×2、bypass×3；5u：upload×47、bypass×12。优化后行待测。
+
 | 场景 | Users | 指标类型 | 接口 / 说明 | RPS | P95 (ms) | 错误率 |
 |------|-------|----------|-------------|-----|----------|--------|
-| 优化前 | 1 | 受理(=端到端) | POST /api/resume/upload |  |  |  |
-| 优化前 | 1 | 旁路 | GET /api/jobs?page=1&page_size=50 |  |  |  |
-| 优化前 | 5 | 受理(=端到端) | POST /api/resume/upload |  |  |  |
-| 优化前 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 |  |  |  |
-| 优化后 | 1 | 受理 | POST /api/resume/upload → 202 |  |  |  |
-| 优化后 | 1 | 端到端完成 | upload + 轮询 task |  |  |  |
-| 优化后 | 5 | 受理 | POST /api/resume/upload → 202 |  |  |  |
-| 优化后 | 5 | 端到端完成 | upload + 轮询 task |  |  |  |
-| 优化后 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 |  |  |  |
-| 优化后（可选 T6） | 1 | 秒传 | 同一 PDF 第二次上传 |  |  |  |
+| 优化前 | 1 | 受理(=端到端) | POST /api/resume/upload | **≈0.04** | **17000** | **0%** (0/2) |
+| 优化前 | 1 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0.06** | **13000** | **0%** (0/3) |
+| 优化前 | 5 | 受理(=端到端) | POST /api/resume/upload | **≈0.1** | **18000** | **0%** (0/47) |
+| 优化前 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0** | **4** | **0%** (0/12) |
+| 优化后 | 1 | 受理 | POST /api/resume/upload → 202 | __ | __ | __ |
+| 优化后 | 1 | 端到端完成 | upload + 轮询 task | __ | __ | __ |
+| 优化后 | 5 | 受理 | POST /api/resume/upload → 202 | __ | __ | __ |
+| 优化后 | 5 | 端到端完成 | upload + 轮询 task | __ | __ | __ |
+| 优化后 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 | __ | __ | __ |
+| 优化后（可选 T6） | 1 | 秒传 | 同一 PDF 第二次上传 | __ | __ | __ |
 
-> 条件备注（必填）：Mock 延迟 = ____ ms；PDF 路径/大小 = ____；API 启动方式 = `python api_server.py`。
+> 条件备注：Mock 延迟 ≈ **800 ms**；PDF ≈ `tests/fixtures/sample_resume.pdf`（或 uploads 下 AgentHarness.pdf）；API = `python api_server.py` + `LLM_API_URL`→Mock。  
+> 旁路补充：jobs Avg Size≈**67KB**（分页优化后正常）。1u 时 P95 被上传阻塞抬到 **13s**；5u 时 P95 回到 **4ms**，但 upload 仍约 **17～18s**——主矛盾是同步长任务，不是 jobs 体积。
 )
