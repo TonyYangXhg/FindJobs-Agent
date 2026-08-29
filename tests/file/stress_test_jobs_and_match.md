@@ -174,7 +174,7 @@ python api_server.py
 #### Step 1：创建脚本 `test/locustfile.py`
 
 ```python
-# test/locustfile.py
+# test/locustfile_jobs_and_match.py
 import os
 from locust import HttpUser, task, between
 
