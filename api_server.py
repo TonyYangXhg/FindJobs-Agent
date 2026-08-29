@@ -10,10 +10,11 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from flask import Flask, request, jsonify, send_file
@@ -63,8 +64,37 @@ jobs_store: List[Dict[str, Any]] = []
 interview_sessions: Dict[str, Dict[str, Any]] = {}
 RESUME_STORE_FILE = UPLOAD_FOLDER / "resumes_store.json"
 
+# P1/P2: 进程内 jobs 缓存 + 读写锁（按数据文件 mtime 失效）
+_jobs_lock = threading.RLock()
+_jobs_cache: List[Dict[str, Any]] = []
+_jobs_cache_mtime: Optional[float] = None
+_jobs_cache_source: str = "none"
+_jobs_cache_path: Optional[Path] = None
+
 # Regex for valid UUID-style file IDs (path traversal protection)
 _VALID_FILE_ID_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+# 列表/匹配响应字段裁剪
+_JOB_LIST_FIELDS = (
+    "id",
+    "title",
+    "company",
+    "location",
+    "required_skills",
+    "apply_url",
+    "source_url",
+    "salary_range",
+    "posted_date",
+    "job_level1",
+    "job_level2",
+    "category",
+    "min_degree",
+)
+_DESC_SUMMARY_LEN = 200
+_DEFAULT_PAGE_SIZE = 50
+_MAX_PAGE_SIZE = 100
+_DEFAULT_TOP_K = 20
+_MAX_TOP_K = 100
 
 
 def _is_safe_file_id(file_id: str) -> bool:
@@ -126,6 +156,214 @@ def _enrich_job_skills(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 _load_resumes_from_disk()
+
+
+def parse_skill_tags(tag_string: str) -> List[str]:
+    """解析技能标签字符串，返回技能名称列表"""
+    return [name for name, _score in job_matcher.parse_job_skills(tag_string)]
+
+
+def _resolve_jobs_data_file() -> Tuple[Optional[Path], str]:
+    """按优先级解析岗位数据文件路径与来源标识。"""
+    enriched_csv = ROOT_DIR / "jobs_enriched.csv"
+    if enriched_csv.exists():
+        return enriched_csv, "enriched_csv"
+    json_file = ROOT_DIR / "all_companies_jobs.json"
+    if json_file.exists():
+        return json_file, "json"
+    bytedance_csv = ROOT_DIR / "bytedance_jobs_enriched.csv"
+    if bytedance_csv.exists():
+        return bytedance_csv, "bytedance_csv"
+    return None, "none"
+
+
+def _parse_jobs_from_enriched_csv(path: Path) -> List[Dict[str, Any]]:
+    df = pd.read_csv(path)
+    jobs: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        skill_tags_raw = str(row.get("skill_tags", ""))
+        job = {
+            "id": str(row.get("job_id", uuid.uuid4())),
+            "title": str(row.get("job_title", "")),
+            "company": str(row.get("company_name", "")),
+            "description": str(row.get("job_description", "")),
+            "required_skills": parse_skill_tags(skill_tags_raw),
+            "location": str(row.get("location", "")),
+            "salary_range": "面议",
+            "posted_date": "2024-01-01",
+            "job_level1": str(row.get("job_level1", "")),
+            "job_level2": str(row.get("job_level2", "")),
+            "min_degree": str(row.get("min_degree", "")),
+            "degree_priority": str(row.get("degree_priority", "")),
+            "major_requirement": str(row.get("major_requirement_text", "")),
+            "skill_tags_raw": skill_tags_raw,
+            "apply_url": str(row.get("apply_url", "")),
+            "source_url": str(row.get("source_url", "")),
+            "category": str(row.get("category", "")),
+            "requirements": str(row.get("job_requirements", "")),
+        }
+        jobs.append(_enrich_job_skills(job))
+    return jobs
+
+
+def _parse_jobs_from_json(path: Path) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw_jobs = json.load(f)
+
+    jobs: List[Dict[str, Any]] = []
+    for raw in raw_jobs:
+        skill_tags_raw = str(raw.get("skill_tags", ""))
+        has_enriched = bool(skill_tags_raw and skill_tags_raw != "nan")
+        job = {
+            "id": str(raw.get("job_id", uuid.uuid4())),
+            "title": str(raw.get("job_title", "")),
+            "company": str(raw.get("company_name", "")),
+            "description": str(raw.get("job_description", "")),
+            "required_skills": parse_skill_tags(skill_tags_raw) if has_enriched else [],
+            "location": str(raw.get("location", "")),
+            "salary_range": "面议",
+            "posted_date": "2024-01-01",
+            "job_level1": str(raw.get("job_level1", raw.get("job_type", ""))),
+            "job_level2": str(raw.get("job_level2", raw.get("special_program", ""))),
+            "min_degree": str(raw.get("min_degree", "")),
+            "degree_priority": str(raw.get("degree_priority", "")),
+            "major_requirement": str(raw.get("major_requirement", "")),
+            "skill_tags_raw": skill_tags_raw,
+            "apply_url": str(raw.get("apply_url", "")),
+            "source_url": str(raw.get("source_url", "")),
+            "category": str(raw.get("category", "")),
+            "requirements": str(raw.get("job_requirements", "")),
+        }
+        jobs.append(_enrich_job_skills(job))
+    return jobs
+
+
+def _parse_jobs_from_bytedance_csv(path: Path) -> List[Dict[str, Any]]:
+    df = pd.read_csv(path)
+    jobs: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        skill_tags_raw = str(row.get("skill_tags", ""))
+        job = {
+            "id": str(row.get("job_id", uuid.uuid4())),
+            "title": str(row.get("job_title", "")),
+            "company": str(row.get("company_name", "字节跳动")),
+            "description": str(row.get("job_description", "")),
+            "required_skills": parse_skill_tags(skill_tags_raw),
+            "location": str(row.get("location", "")),
+            "salary_range": "面议",
+            "posted_date": "2024-01-01",
+            "job_level1": str(row.get("job_level1", "")),
+            "job_level2": str(row.get("job_level2", "")),
+            "min_degree": str(row.get("min_degree", "")),
+            "skill_tags_raw": skill_tags_raw,
+            "apply_url": str(row.get("apply_url", "")),
+            "source_url": str(row.get("source_url", "")),
+        }
+        jobs.append(_enrich_job_skills(job))
+    return jobs
+
+
+def _parse_jobs_file(path: Path, source: str) -> List[Dict[str, Any]]:
+    if source == "enriched_csv":
+        return _parse_jobs_from_enriched_csv(path)
+    if source == "json":
+        return _parse_jobs_from_json(path)
+    if source == "bytedance_csv":
+        return _parse_jobs_from_bytedance_csv(path)
+    return []
+
+
+def _sync_jobs_store(jobs: List[Dict[str, Any]]) -> None:
+    """在持锁状态下同步 jobs_store 与缓存列表。"""
+    jobs_store.clear()
+    jobs_store.extend(jobs)
+
+
+def _ensure_jobs_loaded() -> Tuple[List[Dict[str, Any]], str]:
+    """
+    按数据文件 mtime 加载/复用岗位缓存，并同步 jobs_store。
+    必须在短临界区内完成读缓存 / 写缓存 / 写 jobs_store。
+    """
+    global _jobs_cache, _jobs_cache_mtime, _jobs_cache_source, _jobs_cache_path
+
+    with _jobs_lock:
+        path, source = _resolve_jobs_data_file()
+        if path is None:
+            _jobs_cache = []
+            _jobs_cache_mtime = None
+            _jobs_cache_source = "none"
+            _jobs_cache_path = None
+            _sync_jobs_store([])
+            return [], "none"
+
+        mtime = path.stat().st_mtime
+        if (
+            _jobs_cache
+            and _jobs_cache_mtime == mtime
+            and _jobs_cache_source == source
+            and _jobs_cache_path == path
+        ):
+            return _jobs_cache, source
+
+        logging.info(f"从数据文件加载岗位: {path} (source={source})")
+        jobs = _parse_jobs_file(path, source)
+        _jobs_cache = jobs
+        _jobs_cache_mtime = mtime
+        _jobs_cache_source = source
+        _jobs_cache_path = path
+        _sync_jobs_store(jobs)
+        logging.info(f"加载了 {len(jobs)} 个岗位 (source={source})")
+        return jobs, source
+
+
+def _trim_job_for_list(job: Dict[str, Any]) -> Dict[str, Any]:
+    """列表响应字段裁剪：不含完整 description/requirements。"""
+    item = {field: job.get(field) for field in _JOB_LIST_FIELDS}
+    desc = str(job.get("description") or "")
+    item["description_summary"] = desc[:_DESC_SUMMARY_LEN]
+    skills = item.get("required_skills") or []
+    if isinstance(skills, list) and len(skills) > 30:
+        item["required_skills"] = skills[:30]
+    return item
+
+
+def _trim_job_for_match(job: Dict[str, Any]) -> Dict[str, Any]:
+    """匹配结果内嵌岗位字段裁剪。"""
+    return {
+        "id": job.get("id"),
+        "title": job.get("title"),
+        "company": job.get("company"),
+        "location": job.get("location"),
+        "required_skills": (job.get("required_skills") or [])[:30],
+        "apply_url": job.get("apply_url", ""),
+        "source_url": job.get("source_url", ""),
+        "salary_range": job.get("salary_range", ""),
+    }
+
+
+def _trim_match_result(match: Dict[str, Any]) -> Dict[str, Any]:
+    """匹配结果字段精简，去掉超长 JD。"""
+    details = match.get("match_details") or {}
+    job = match.get("job") or {}
+    return {
+        "job_id": match.get("job_id"),
+        "match_score": match.get("match_score"),
+        "matched_skills": match.get("matched_skills") or [],
+        "missing_skills": match.get("missing_skills") or [],
+        "match_details": {
+            "match_count": details.get("match_count"),
+            "total_job_skills": details.get("total_job_skills"),
+            "match_rate": details.get("match_rate"),
+            "avg_resume_score": details.get("avg_resume_score"),
+        },
+        "job": _trim_job_for_match(job) if isinstance(job, dict) else job,
+    }
+
+
+def _parse_bool_flag(raw: Optional[str]) -> bool:
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 @app.route('/api/health', methods=['GET'])
@@ -232,166 +470,106 @@ def get_resume(resume_id: str):
 
 @app.route('/api/jobs', methods=['GET'])
 def get_jobs():
-    """获取岗位列表
-    
-    数据加载伈先级：
+    """获取岗位列表（默认分页 + 字段裁剪；?all=1 返回较全字段）
+
+    数据加载优先级：
     1. jobs_enriched.csv - 流水线智能分析后的完整数据（含技能评分）
     2. all_companies_jobs.json - 爬取的JSON数据（可能含技能标签）
     3. bytedance_jobs_enriched.csv - 原始字节跳动数据
     """
     try:
-        jobs = []
-        data_source = "none"
-        
-        # 优先级1: 流水线智能分析后的CSV（包含技能评分）
-        enriched_csv = ROOT_DIR / 'jobs_enriched.csv'
-        if enriched_csv.exists():
-            logging.info(f"从智能分析CSV加载岗位: {enriched_csv}")
-            df = pd.read_csv(enriched_csv)
-            
-            for _, row in df.iterrows():
-                skill_tags_raw = str(row.get('skill_tags', ''))
-                job = {
-                    'id': str(row.get('job_id', uuid.uuid4())),
-                    'title': str(row.get('job_title', '')),
-                    'company': str(row.get('company_name', '')),
-                    'description': str(row.get('job_description', '')),
-                    'required_skills': parse_skill_tags(skill_tags_raw),
-                    'location': str(row.get('location', '')),
-                    'salary_range': '面议',
-                    'posted_date': '2024-01-01',
-                    'job_level1': str(row.get('job_level1', '')),
-                    'job_level2': str(row.get('job_level2', '')),
-                    'min_degree': str(row.get('min_degree', '')),
-                    'degree_priority': str(row.get('degree_priority', '')),
-                    'major_requirement': str(row.get('major_requirement_text', '')),
-                    'skill_tags_raw': skill_tags_raw,
-                    'apply_url': str(row.get('apply_url', '')),
-                    'source_url': str(row.get('source_url', '')),
-                    'category': str(row.get('category', '')),
-                    'requirements': str(row.get('job_requirements', '')),
-                }
-                jobs.append(_enrich_job_skills(job))
-            
-            data_source = "enriched_csv"
-            logging.info(f"从智能分析CSV加载了 {len(jobs)} 个岗位（含技能评分）")
-        
-        # 优先级2: JSON文件（可能经过智能分析，也可能是原始数据）
-        elif (ROOT_DIR / 'all_companies_jobs.json').exists():
-            json_file = ROOT_DIR / 'all_companies_jobs.json'
-            logging.info(f"从JSON文件加载岗位: {json_file}")
-            with open(json_file, 'r', encoding='utf-8') as f:
-                raw_jobs = json.load(f)
-            
-            for raw in raw_jobs:
-                # 检查是否有智能分析后的技能标签
-                skill_tags_raw = str(raw.get('skill_tags', ''))
-                has_enriched = bool(skill_tags_raw and skill_tags_raw != 'nan')
-                
-                job = {
-                    'id': str(raw.get('job_id', uuid.uuid4())),
-                    'title': str(raw.get('job_title', '')),
-                    'company': str(raw.get('company_name', '')),
-                    'description': str(raw.get('job_description', '')),
-                    'required_skills': parse_skill_tags(skill_tags_raw) if has_enriched else [],
-                    'location': str(raw.get('location', '')),
-                    'salary_range': '面议',
-                    'posted_date': '2024-01-01',
-                    'job_level1': str(raw.get('job_level1', raw.get('job_type', ''))),
-                    'job_level2': str(raw.get('job_level2', raw.get('special_program', ''))),
-                    'min_degree': str(raw.get('min_degree', '')),
-                    'degree_priority': str(raw.get('degree_priority', '')),
-                    'major_requirement': str(raw.get('major_requirement', '')),
-                    'skill_tags_raw': skill_tags_raw,
-                    'apply_url': str(raw.get('apply_url', '')),
-                    'source_url': str(raw.get('source_url', '')),
-                    'category': str(raw.get('category', '')),
-                    'requirements': str(raw.get('job_requirements', '')),
-                }
-                jobs.append(_enrich_job_skills(job))
-            
-            # 统计朊技能标签的岗位
-            with_skills = sum(1 for j in jobs if j['required_skills'])
-            data_source = "json"
-            logging.info(f"从JSON加载了 {len(jobs)} 个岗位（{with_skills}个含技能标签）")
-        
-        # 优先级3: 原始字节跳动mCSV
-        elif (ROOT_DIR / 'bytedance_jobs_enriched.csv').exists():
-            csv_file = ROOT_DIR / 'bytedance_jobs_enriched.csv'
-            logging.info(f"从原始CSV文件加载岗位: {csv_file}")
-            df = pd.read_csv(csv_file)
-            
-            for _, row in df.iterrows():
-                skill_tags_raw = str(row.get('skill_tags', ''))
-                job = {
-                    'id': str(row.get('job_id', uuid.uuid4())),
-                    'title': str(row.get('job_title', '')),
-                    'company': str(row.get('company_name', '字节旋动')),
-                    'description': str(row.get('job_description', '')),
-                    'required_skills': parse_skill_tags(skill_tags_raw),
-                    'location': str(row.get('location', '')),
-                    'salary_range': '面议',
-                    'posted_date': '2024-01-01',
-                    'job_level1': str(row.get('job_level1', '')),
-                    'job_level2': str(row.get('job_level2', '')),
-                    'min_degree': str(row.get('min_degree', '')),
-                    'skill_tags_raw': skill_tags_raw,
-                    'apply_url': str(row.get('apply_url', '')),
-                    'source_url': str(row.get('source_url', ''))
-                }
-                jobs.append(_enrich_job_skills(job))
-            
-            data_source = "bytedance_csv"
-            logging.info(f"从原始CSV加载了 {len(jobs)} 个岗位")
-        
-        else:
-            return jsonify({'jobs': [], 'message': 'No jobs file found'}), 200
-        
-        jobs_store.clear()
-        jobs_store.extend(jobs)
-        
+        jobs, data_source = _ensure_jobs_loaded()
+        if data_source == "none":
+            return jsonify({
+                "jobs": [],
+                "total": 0,
+                "page": 1,
+                "page_size": _DEFAULT_PAGE_SIZE,
+                "message": "No jobs file found",
+                "data_source": data_source,
+            }), 200
+
+        return_all = _parse_bool_flag(request.args.get("all"))
+        if return_all:
+            with _jobs_lock:
+                snapshot = list(jobs)
+            return jsonify({
+                "jobs": snapshot,
+                "total": len(snapshot),
+                "page": 1,
+                "page_size": len(snapshot),
+                "data_source": data_source,
+            }), 200
+
+        try:
+            page = int(request.args.get("page", 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(request.args.get("page_size", _DEFAULT_PAGE_SIZE))
+        except (TypeError, ValueError):
+            page_size = _DEFAULT_PAGE_SIZE
+
+        page = max(1, page)
+        page_size = max(1, min(page_size, _MAX_PAGE_SIZE))
+
+        with _jobs_lock:
+            total = len(jobs)
+            start = (page - 1) * page_size
+            end = start + page_size
+            page_jobs = jobs[start:end]
+            trimmed = [_trim_job_for_list(job) for job in page_jobs]
+
         return jsonify({
-            'jobs': jobs, 
-            'total': len(jobs),
-            'data_source': data_source,
+            "jobs": trimmed,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "data_source": data_source,
         }), 200
-        
+
     except Exception as e:
         logging.error(f"加载岗位失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
-def parse_skill_tags(tag_string: str) -> List[str]:
-    """解析技能标签字符串，返回技能名称列表"""
-    return [name for name, _score in job_matcher.parse_job_skills(tag_string)]
-
-
 @app.route('/api/jobs/match', methods=['POST'])
 def match_jobs():
-    """岗位匹配"""
+    """岗位匹配（全量计分，仅返回 top_k）"""
     try:
-        data = request.json
+        data = request.json or {}
         resume_id = data.get('resume_id')
-        
+
         if not resume_id or resume_id not in resumes_store:
             return jsonify({'error': 'Resume not found'}), 404
-        
+
+        try:
+            top_k = int(data.get("top_k", _DEFAULT_TOP_K))
+        except (TypeError, ValueError):
+            top_k = _DEFAULT_TOP_K
+        top_k = max(1, min(top_k, _MAX_TOP_K))
+
         resume_data = resumes_store[resume_id]
         resume_skills = resume_data['skills']
-        
-        # 加载岗位
-        if not jobs_store:
-            get_jobs()
-        
-        # 匹配岗位（已经按匹配度排序）
-        matches = job_matcher.match_jobs(resume_skills, jobs_store)
-        
-        # 返回匹配结果，已经按匹配度从高到低排序
+
+        # 确保 jobs_store / 缓存已加载（锁内短临界区）
+        jobs, _data_source = _ensure_jobs_loaded()
+        with _jobs_lock:
+            jobs_snapshot = list(jobs)
+
+        # 匹配岗位（已经按匹配度排序）；锁外计算，避免长时间持锁
+        matches = job_matcher.match_jobs(resume_skills, jobs_snapshot)
+        total_matched = len(matches)
+        top_matches = [_trim_match_result(m) for m in matches[:top_k]]
+
         return jsonify({
-            'matches': matches,
-            'resume_id': resume_id
+            'matches': top_matches,
+            'resume_id': resume_id,
+            'top_k': top_k,
+            'total_matched': total_matched,
+            'candidate_total': len(jobs_snapshot),
         }), 200
-        
+
     except Exception as e:
         logging.error(f"岗位匹配失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
@@ -404,16 +582,19 @@ def start_interview():
         data = request.json
         resume_id = data.get('resume_id')
         job_id = data.get('job_id')
-        
+
         if resume_id and resume_id not in resumes_store:
             return jsonify({'error': 'Resume not found'}), 404
-        
+
         session_id = str(uuid.uuid4())
-        
+
         # 获取简历和岗位信息
         resume_data = resumes_store.get(resume_id) if resume_id else None
-        job_data = next((j for j in jobs_store if j['id'] == job_id), None) if job_id else None
-        
+        with _jobs_lock:
+            if not jobs_store:
+                _ensure_jobs_loaded()
+            job_data = next((j for j in jobs_store if j['id'] == job_id), None) if job_id else None
+
         # 初始化面试会话
         interview_sessions[session_id] = {
             'id': session_id,
@@ -427,10 +608,10 @@ def start_interview():
             'qa_count': 0,
             'max_qa': 5
         }
-        
+
         # 生成开场白（不出题）
         start_result = interview_agent.start_interview(resume_data, job_data)
-        
+
         # 添加开场白消息（仅开场白与自我介绍提示）
         greeting_msg = {
             'id': str(uuid.uuid4()),
@@ -444,14 +625,14 @@ def start_interview():
         interview_sessions[session_id]['messages'].append(greeting_msg)
         interview_sessions[session_id]['stage'] = start_result.get('stage', 'greeting')
         interview_sessions[session_id]['phase'] = start_result.get('stage', 'greeting')
-        
+
         return jsonify({
             'session_id': session_id,
             'message': f"{start_result.get('greeting', '')}\n\n{start_result.get('self_intro', '')}",
             'question': None,
             'stage': start_result.get('stage', 'greeting')
         }), 200
-        
+
     except Exception as e:
         logging.error(f"开始面试失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
@@ -463,16 +644,16 @@ def send_interview_message(session_id: str):
     try:
         if session_id not in interview_sessions:
             return jsonify({'error': 'Session not found'}), 404
-        
+
         data = request.json
         user_message = data.get('message', '')
-        
+
         if not user_message:
             return jsonify({'error': 'Message is required'}), 400
-        
+
         session = interview_sessions[session_id]
         current_stage = session.get('stage', 'greeting')
-        
+
         # 添加用户消息
         user_msg = {
             'id': str(uuid.uuid4()),
@@ -482,11 +663,12 @@ def send_interview_message(session_id: str):
             'created_at': datetime.now().isoformat()
         }
         session['messages'].append(user_msg)
-        
+
         # 获取简历和岗位信息
         resume_data = resumes_store.get(session['resume_id']) if session['resume_id'] else None
-        job_data = next((j for j in jobs_store if j['id'] == session['job_id']), None) if session['job_id'] else None
-        
+        with _jobs_lock:
+            job_data = next((j for j in jobs_store if j['id'] == session['job_id']), None) if session['job_id'] else None
+
         # 生成AI回复
         response = interview_agent.respond(
             user_message,
@@ -495,17 +677,17 @@ def send_interview_message(session_id: str):
             job_data,
             session_state=session
         )
-        
+
         # 更新阶段与计数器
         new_phase = response.get('phase', session.get('phase', current_stage))
         session['phase'] = new_phase
         session['stage'] = new_phase
         if 'qa_count' in response:
             session['qa_count'] = response['qa_count']
-        
+
         # 构建回复内容
         reply_content = response.get('message', '')
-        
+
         # 添加AI回复
         assistant_msg = {
             'id': str(uuid.uuid4()),
@@ -518,7 +700,7 @@ def send_interview_message(session_id: str):
             'stage': new_phase
         }
         session['messages'].append(assistant_msg)
-        
+
         return jsonify({
             'message': reply_content,
             'session_id': session_id,
@@ -528,7 +710,7 @@ def send_interview_message(session_id: str):
             'final_feedback': response.get('final_feedback'),
             'average_score': response.get('average_score')
         }), 200
-        
+
     except Exception as e:
         logging.error(f"发送消息失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
@@ -539,7 +721,7 @@ def get_interview_session(session_id: str):
     """获取面试会话"""
     if session_id not in interview_sessions:
         return jsonify({'error': 'Session not found'}), 404
-    
+
     session = interview_sessions[session_id]
     return jsonify({
         'session': {
