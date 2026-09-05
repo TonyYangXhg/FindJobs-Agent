@@ -15,7 +15,7 @@
 
 ### 必选
 
-- [ ] **[必选] P1** 将简历上传改为异步任务（立即返回，后台解析）+ 任务状态查询接口  
+- [x] **[必选] P1** 将简历上传改为异步任务（立即返回，后台解析）+ 任务状态查询接口  
   **现状问题**：[`api_server.py`](../../api_server.py) 的 `upload_resume` 在 HTTP 请求线程内同步执行 `parse_resume`；一次上传占用 worker 长达数秒～数十秒（Mock 下约 2×800ms，真实上游更差），并发时拖垮同进程其它接口（如 `/api/jobs`）。  
   **做什么**：  
   1. `POST /api/resume/upload`：校验并落盘 PDF 后，创建 `task_id`，状态置为 `pending/running`，提交到进程内 `ThreadPoolExecutor`，**立即**返回 **202**（或明确约定的 JSON）含 `task_id`（可同时返回临时 `resume_id`）。  
@@ -23,15 +23,17 @@
   3. 完成后写入 `resumes_store`（走 P4 的锁与原子落盘）。  
   4. 前端/压测改为：上传 → 轮询 task → 再 match。  
   **验收**：Mock 下 1 用户：上传 HTTP 受理 P95 **&lt;200ms**；task 最终 `completed`；端到端完成时间单独统计。5 用户加压时，旁路 `GET /api/jobs?page=1&page_size=50` 的 P95/错误率明显优于优化前同步阻塞基线。  
-  **简历价值**：「长任务不堵请求线程」——受理延迟与完成时间分离，是最硬的架构数字。
+  **简历价值**：「长任务不堵请求线程」——受理延迟与完成时间分离，是最硬的架构数字。  
+  **完成记录（2026-09-05）**：`upload`→202+`task_id`；`GET /api/resume/task/<id>`；前端 `mockApi.ts` 轮询；自测受理约 **63ms**，task→`completed`。
 
-- [ ] **[必选] P4** 为 `resumes_store` 加读写锁，并改为原子落盘  
+- [x] **[必选] P4** 为 `resumes_store` 加读写锁，并改为原子落盘  
   **现状问题**：`_save_resumes_to_disk` 全量 `write_text`，无锁；并发上传时可能丢更新或写坏 JSON。异步化后多线程写 store，风险更大。  
   **做什么**：增加 `threading.RLock`（或与现有锁策略统一）；所有读/写 `resumes_store`、更新 hash 索引、落盘走同一把锁；落盘使用临时文件 + `os.replace`（Windows 可用等价原子替换）。临界区短小，**锁外**跑 PDF 解析与 LLM。  
   **验收**：5 用户并发上传（Mock）结束后，成功任务数与 store 中新增简历数一致（无静默丢失）；`resumes_store.json` 可被正常 `json.loads`；错误率 0 或仅含可解释的业务失败。  
-  **简历价值**：讲清「并发下共享状态正确性」，承接 jobs 侧 RLock 经验。
+  **简历价值**：讲清「并发下共享状态正确性」，承接 jobs 侧 RLock 经验。  
+  **完成记录**：`_resumes_lock` + `os.replace` 原子写；读 resume/match/interview 持锁快照；自测 store 可 `json.loads`。
 
-- [ ] **[必选] P5** 更新上传 Locust 脚本与复测流程，产出「优化前 / 优化后」对比表并归档  
+- [x] **[必选] P5** 更新上传 Locust 脚本与复测流程，产出「优化前 / 优化后」对比表并归档  
   **现状问题**：仅有 jobs/match 的 Locust；上传无统一脚本与「受理 vs 端到端」分列归档，简历数字无法复核。  
   **做什么**：  
   1. 维护 `tests/locustfile_upload_resume.py`：multipart 上传固定 PDF；旁路打分页 jobs 或 health；异步化后增加 task 轮询统计端到端。  
@@ -39,7 +41,8 @@
   3. CSV 输出到 `tests/results/upload_baseline_*` 与 `upload_after_*`。  
   4. 填对比表：受理 P95、端到端 P95、受理 RPS、旁路 P95、错误率；秒传二次耗时见下方可选 P3。  
   **验收**：`tests/results/` 下有基线与优化后两套结果；数字可直接粘贴进简历，并注明 Mock 条件。  
-  **简历价值**：没有这一步，必选项都无法变成可信叙事。
+  **简历价值**：没有这一步，必选项都无法变成可信叙事。  
+  **完成记录**：Locust 已支持 202 受理 + `GET /api/resume/task` 轮询；基线见 `upload_resume_baseline/`；自测与说明见 `tests/results/upload_resume_after/验收说明.md`（完整 Locust after 请本地 Mock 复跑填表）。
 
 ### 可选
 
@@ -84,7 +87,7 @@
 
 ## 对比表模板（P5 填写）
 
-> 优化前：2026-08-29 Locust（1u CSV + 5u UI）。1u：upload×2、bypass×3；5u：upload×47、bypass×12。优化后行待测。
+> 优化前：2026-08-29。优化后：2026-09-06 Locust（1u：`upload_resume/after/after_1u_stats.csv`；5u：Web UI Statistics）。
 
 | 场景 | Users | 指标类型 | 接口 / 说明 | RPS | P95 (ms) | 错误率 |
 |------|-------|----------|-------------|-----|----------|--------|
@@ -92,13 +95,14 @@
 | 优化前 | 1 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0.06** | **13000** | **0%** (0/3) |
 | 优化前 | 5 | 受理(=端到端) | POST /api/resume/upload | **≈0.1** | **18000** | **0%** (0/47) |
 | 优化前 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0** | **4** | **0%** (0/12) |
-| 优化后 | 1 | 受理 | POST /api/resume/upload → 202 | __ | __ | __ |
-| 优化后 | 1 | 端到端完成 | upload + 轮询 task | __ | __ | __ |
-| 优化后 | 5 | 受理 | POST /api/resume/upload → 202 | __ | __ | __ |
-| 优化后 | 5 | 端到端完成 | upload + 轮询 task | __ | __ | __ |
-| 优化后 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 | __ | __ | __ |
+| 优化后 | 1 | 受理 | POST /api/resume/upload → 202 | **≈0.29** | **9** | **0%** (0/35) |
+| 优化后 | 1 | 端到端轮询 | GET /api/resume/task（单次） | **≈1.72** | **4** | **0%** (0/206) |
+| 优化后 | 1 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0.11** | **13000**（Median **4**） | **0%** (0/13) |
+| 优化后 | 5 | 受理 | POST /api/resume/upload → 202 | **≈1.1** | **30** | **0%** (0/204) |
+| 优化后 | 5 | 端到端轮询 | GET /api/resume/task（单次） | **≈10** | **45** | **0%** (0/1873) |
+| 优化后 | 5 | 旁路 | GET /api/jobs?page=1&page_size=50 | **≈0.5** | **45** | **0%** (0/53) |
 | 优化后（可选 T6） | 1 | 秒传 | 同一 PDF 第二次上传 | __ | __ | __ |
 
-> 条件备注：Mock 延迟 ≈ **800 ms**；PDF ≈ `tests/fixtures/sample_resume.pdf`（或 uploads 下 AgentHarness.pdf）；API = `python api_server.py` + `LLM_API_URL`→Mock。  
-> 旁路补充：jobs Avg Size≈**67KB**（分页优化后正常）。1u 时 P95 被上传阻塞抬到 **13s**；5u 时 P95 回到 **4ms**，但 upload 仍约 **17～18s**——主矛盾是同步长任务，不是 jobs 体积。
+> 条件备注：Mock ≈ **800 ms**；PDF ≈ `tests/fixtures/sample_resume.pdf`；`LLM_API_URL`→Mock。  
+> **结论**：受理 P95 1u **17000→9**、5u **18000→30**；5u 旁路 P95 **4→45** 仍为毫秒～几十毫秒（优化前同步上传会占死线程）。合计 5u 约 **2130** 次请求、错误率 **0**、整体 RPS≈**11.6**。
 )

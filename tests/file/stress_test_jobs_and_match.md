@@ -9,12 +9,12 @@
 ## 1）任务清单（按顺序做）
 
 - [x] **T1** 搭环境：安装 Locust、准备一份固定测试简历 ID、确认 `jobs_enriched.csv` 已加载、记录「优化前」启动方式（当前 `python app.py` / Flask 开发服）
-- [ ] **T2** 写 Mock LLM 上游（固定 ~800ms 延迟 + 预设 JSON），用环境变量把 `LLM_API_URL` 指过去（本方案默认 **不压真实 LLM 接口**，节省成本且结果可复现）
+- [x] **T2** 写 Mock LLM 上游（固定 ~800ms 延迟 + 预设 JSON），用环境变量把 `LLM_API_URL` 指过去（本方案默认 **不压真实 LLM 接口**，节省成本且结果可复现）
 - [x] **T3** 建立 Baseline：用 Locust 压测 **重点 A：`GET /api/jobs`** + **重点 B：`POST /api/jobs/match`**，记录 QPS、P50/P95、错误率，截图/表格存档
 - [x] **T4** 做最小优化（建议只做这 3 件）：`/api/jobs` 进程内缓存（按文件 mtime 失效）、匹配结果短缓存、共享 `jobs_store` 读写加锁；可选：gunicorn `gthread` 替换 `app.run`
-- [ ] **T5** 同场景复测：相同 Locust 参数再跑一遍，填「优化前 → 优化后」对比表
+- [x] **T5** 同场景复测：相同 Locust 参数再跑一遍，填「优化前 → 优化后」对比表
 - [ ] **T6**（可选加分）面试链路伪依赖消除：`evaluate_answer` 与 `generate_technical_question` 并发；用 Mock LLM 测单轮延迟下降幅度
-- [ ] **T7** 整理简历素材：1 张对比表 + 2～3 句「约束 → 方案 → 数字」结论；把 Locust 命令、参数、原始报告放进 `test/results/`
+- [x] **T7** 整理简历素材：1 张对比表 + 2～3 句「约束 → 方案 → 数字」结论；把 Locust 命令、参数、原始报告放进 `test/results/`
 
 ---
 
@@ -259,9 +259,13 @@ locust -f test\locustfile.py --host http://127.0.0.1:5000 `
 | 优化前 | 1 | 1 | GET /api/jobs | 0 | 13000 | 0 |
 | 优化前 | 1 | 1 | POST /api/jobs/match | 0 | 180 | 0 |
 
-![](E:\LLM\project\FindJobs-Agent\tests\pic\stress_1_优化前.png)
+Figure 1.1 优化后 user=1
 
-![](E:\LLM\project\FindJobs-Agent\tests\pic\stress_2_优化前.png)
+![](./../pic/jobs_and_match/stress_1_优化前.png)
+
+Figure 1.2 优化后 user=1
+
+<img src="./../pic/jobs_and_match/stress_2_优化前.png" style="zoom:50%;" />
 
 > 若错误率突然飙高：先把 users 降到 20 重跑；也可能是 Flask 开发服扛不住——这本身就可以写成「优化动机」。
 
@@ -279,21 +283,21 @@ locust -f test\locustfile.py --host http://127.0.0.1:5000 `
 | 优化后 | 10    | 5       | GET /api/jobs?page=18&page_size=50 | 14.4 | 280ms    | 0%     |
 | 优化后 | 10    | 5       | POST /api/jobs/match (top_k=20)    | 9.3  | 330ms    | 0%     |
 
-Figure 1.1 优化前 user=1
+Figure 2.1 优化后 user=1
 
 ![](../pic/jobs_and_match/stress_1_优化后.png)
 
-Figure 1.2 优化前 user=1
+Figure 2.2 优化后 user=1
 
-![stress_2_优化后](../pic/jobs_and_match/stress_2_优化后.png)
+<img src="../pic/jobs_and_match/stress_2_优化后.png" alt="stress_2_优化后" style="zoom:50%;" />
 
-Figure 2.1 优化后 user=10
+Figure 2.3 优化后 user=10
 
 ![](../pic/jobs_and_match/stress_1_优化后_user_10.png)
 
-Figure 2.2 优化后 user=10
+Figure 2.4 优化后 user=10
 
-![](../pic/jobs_and_match/stress_2_优化后_user_10.png)
+<img src="../pic/jobs_and_match/stress_2_优化后_user_10.png" style="zoom:50%;" />
 
 
 
