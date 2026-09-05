@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,6 +65,17 @@ jobs_store: List[Dict[str, Any]] = []
 interview_sessions: Dict[str, Dict[str, Any]] = {}
 RESUME_STORE_FILE = UPLOAD_FOLDER / "resumes_store.json"
 
+# P4: resumes_store 读写锁 + 原子落盘
+_resumes_lock = threading.RLock()
+
+# P1: 简历上传异步任务
+_RESUME_UPLOAD_WORKERS = int(os.environ.get("RESUME_UPLOAD_WORKERS", "2"))
+_resume_upload_executor = ThreadPoolExecutor(
+    max_workers=max(1, _RESUME_UPLOAD_WORKERS),
+    thread_name_prefix="resume-upload",
+)
+resume_tasks: Dict[str, Dict[str, Any]] = {}
+
 # P1/P2: 进程内 jobs 缓存 + 读写锁（按数据文件 mtime 失效）
 _jobs_lock = threading.RLock()
 _jobs_cache: List[Dict[str, Any]] = []
@@ -112,20 +124,82 @@ def _load_resumes_from_disk() -> None:
     try:
         payload = json.loads(RESUME_STORE_FILE.read_text(encoding="utf-8"))
         if isinstance(payload, dict):
-            resumes_store.update(payload)
+            with _resumes_lock:
+                resumes_store.update(payload)
             logging.info(f"已从磁盘恢复 {len(payload)} 份简历")
     except Exception as e:
         logging.warning(f"恢复简历缓存失败: {e}")
 
 
-def _save_resumes_to_disk() -> None:
+def _save_resumes_to_disk_unlocked() -> None:
+    """原子落盘；调用方须已持有 _resumes_lock。"""
     try:
-        RESUME_STORE_FILE.write_text(
+        tmp_path = RESUME_STORE_FILE.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(resumes_store, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp_path, RESUME_STORE_FILE)
     except Exception as e:
         logging.warning(f"保存简历缓存失败: {e}")
+
+
+def _save_resumes_to_disk() -> None:
+    with _resumes_lock:
+        _save_resumes_to_disk_unlocked()
+
+
+def _set_resume_task(task_id: str, **fields: Any) -> None:
+    with _resumes_lock:
+        task = resume_tasks.get(task_id)
+        if task is None:
+            return
+        task.update(fields)
+        task["updated_at"] = datetime.now().isoformat()
+
+
+def _run_resume_parse_task(task_id: str, resume_id: str, file_path: str, filename: str) -> None:
+    """后台解析简历：LLM/PDF 在锁外执行，写 store 时短临界区。"""
+    _set_resume_task(task_id, status="running")
+    logging.info(f"开始异步解析简历: task={task_id} path={file_path}")
+    try:
+        result = resume_parser.parse_resume(file_path)
+        resume_data = {
+            "id": resume_id,
+            "user_id": "default_user",
+            "file_name": filename,
+            "file_url": f"/api/resume/file/{resume_id}",
+            "extracted_info": result["extracted_info"],
+            "upload_date": result["upload_date"],
+            "status": "completed",
+            "skills": result["skills"],
+        }
+        with _resumes_lock:
+            resumes_store[resume_id] = resume_data
+            _save_resumes_to_disk_unlocked()
+            task = resume_tasks.get(task_id)
+            if task is not None:
+                task.update(
+                    {
+                        "status": "completed",
+                        "error": None,
+                        "resume": {
+                            "id": resume_data["id"],
+                            "user_id": resume_data["user_id"],
+                            "file_name": resume_data["file_name"],
+                            "file_url": resume_data["file_url"],
+                            "extracted_info": resume_data["extracted_info"],
+                            "upload_date": resume_data["upload_date"],
+                            "status": resume_data["status"],
+                        },
+                        "skills": resume_data["skills"],
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                )
+        logging.info(f"简历异步解析完成: task={task_id} resume={resume_id}")
+    except Exception as e:
+        logging.error(f"简历异步解析失败: task={task_id} err={e}", exc_info=True)
+        _set_resume_task(task_id, status="failed", error=str(e))
 
 
 def _enrich_job_skills(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -378,61 +452,70 @@ def health_check():
 
 @app.route('/api/resume/upload', methods=['POST'])
 def upload_resume():
-    """上传并解析简历"""
+    """上传简历：立即受理，后台异步解析（P1）。"""
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
-        
+
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
-        
+
         if not allowed_file(file.filename):
             return jsonify({'error': 'Only PDF files are allowed'}), 400
-        
-        # 保存文件
+
         filename = secure_filename(file.filename)
-        file_id = str(uuid.uuid4())
-        file_path = UPLOAD_FOLDER / f"{file_id}_{filename}"
+        resume_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+        file_path = UPLOAD_FOLDER / f"{resume_id}_{filename}"
         file.save(str(file_path))
-        
-        logging.info(f"开始解析简历: {file_path}")
-        
-        # 解析简历
-        result = resume_parser.parse_resume(str(file_path))
-        
-        # 保存到内存存储
-        resume_data = {
-            'id': file_id,
-            'user_id': 'default_user',  # 可以从认证系统获取
-            'file_name': filename,
-            'file_url': f'/api/resume/file/{file_id}',
-            'extracted_info': result['extracted_info'],
-            'upload_date': result['upload_date'],
-            'status': 'completed',
-            'skills': result['skills']
-        }
-        resumes_store[file_id] = resume_data
-        _save_resumes_to_disk()
-        
-        logging.info(f"简历解析完成: {file_id}")
-        
+
+        now = datetime.now().isoformat()
+        with _resumes_lock:
+            resume_tasks[task_id] = {
+                "task_id": task_id,
+                "resume_id": resume_id,
+                "status": "pending",
+                "error": None,
+                "file_name": filename,
+                "created_at": now,
+                "updated_at": now,
+                "resume": None,
+                "skills": None,
+            }
+
+        _resume_upload_executor.submit(
+            _run_resume_parse_task,
+            task_id,
+            resume_id,
+            str(file_path),
+            filename,
+        )
+        logging.info(f"简历上传已受理: task={task_id} resume={resume_id}")
+
         return jsonify({
-            'resume': {
-                'id': resume_data['id'],
-                'user_id': resume_data['user_id'],
-                'file_name': resume_data['file_name'],
-                'file_url': resume_data['file_url'],
-                'extracted_info': resume_data['extracted_info'],
-                'upload_date': resume_data['upload_date'],
-                'status': resume_data['status']
-            },
-            'skills': resume_data['skills']
-        }), 200
-        
+            "task_id": task_id,
+            "resume_id": resume_id,
+            "status": "pending",
+            "message": "Upload accepted; poll GET /api/resume/task/<task_id>",
+        }), 202
+
     except Exception as e:
-        logging.error(f"简历解析失败: {e}", exc_info=True)
+        logging.error(f"简历上传受理失败: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/resume/task/<task_id>', methods=['GET'])
+def get_resume_task(task_id: str):
+    """查询简历异步解析任务状态（P1）。"""
+    if not _is_safe_file_id(task_id):
+        return jsonify({'error': 'Invalid task ID'}), 400
+    with _resumes_lock:
+        task = resume_tasks.get(task_id)
+        if task is None:
+            return jsonify({'error': 'Task not found'}), 404
+        payload = dict(task)
+    return jsonify(payload), 200
 
 
 @app.route('/api/resume/file/<file_id>', methods=['GET'])
@@ -454,10 +537,12 @@ def get_resume_file(file_id: str):
 @app.route('/api/resume/<resume_id>', methods=['GET'])
 def get_resume(resume_id: str):
     """获取箠历详情"""
-    if resume_id not in resumes_store:
-        return jsonify({'error': 'Resume not found'}), 404
-    
-    resume_data = resumes_store[resume_id]
+    with _resumes_lock:
+        if resume_id not in resumes_store:
+            return jsonify({'error': 'Resume not found'}), 404
+        resume_data = dict(resumes_store[resume_id])
+        skills = list(resume_data.get('skills') or [])
+
     return jsonify({
         'resume': {
             'id': resume_data['id'],
@@ -468,7 +553,7 @@ def get_resume(resume_id: str):
             'upload_date': resume_data['upload_date'],
             'status': resume_data['status']
         },
-        'skills': resume_data['skills']
+        'skills': skills
     }), 200
 
 
@@ -544,17 +629,16 @@ def match_jobs():
         data = request.json or {}
         resume_id = data.get('resume_id')
 
-        if not resume_id or resume_id not in resumes_store:
-            return jsonify({'error': 'Resume not found'}), 404
+        with _resumes_lock:
+            if not resume_id or resume_id not in resumes_store:
+                return jsonify({'error': 'Resume not found'}), 404
+            resume_skills = list(resumes_store[resume_id].get('skills') or [])
 
         try:
             top_k = int(data.get("top_k", _DEFAULT_TOP_K))
         except (TypeError, ValueError):
             top_k = _DEFAULT_TOP_K
         top_k = max(1, min(top_k, _MAX_TOP_K))
-
-        resume_data = resumes_store[resume_id]
-        resume_skills = resume_data['skills']
 
         # 确保 jobs_store / 缓存已加载（锁内短临界区）
         jobs, _data_source = _ensure_jobs_loaded()
@@ -587,13 +671,13 @@ def start_interview():
         resume_id = data.get('resume_id')
         job_id = data.get('job_id')
 
-        if resume_id and resume_id not in resumes_store:
-            return jsonify({'error': 'Resume not found'}), 404
+        with _resumes_lock:
+            if resume_id and resume_id not in resumes_store:
+                return jsonify({'error': 'Resume not found'}), 404
+            resume_data = dict(resumes_store[resume_id]) if resume_id else None
 
         session_id = str(uuid.uuid4())
 
-        # 获取简历和岗位信息
-        resume_data = resumes_store.get(resume_id) if resume_id else None
         with _jobs_lock:
             if not jobs_store:
                 _ensure_jobs_loaded()
@@ -669,7 +753,9 @@ def send_interview_message(session_id: str):
         session['messages'].append(user_msg)
 
         # 获取简历和岗位信息
-        resume_data = resumes_store.get(session['resume_id']) if session['resume_id'] else None
+        with _resumes_lock:
+            rid = session.get('resume_id')
+            resume_data = dict(resumes_store[rid]) if rid and rid in resumes_store else None
         with _jobs_lock:
             job_data = next((j for j in jobs_store if j['id'] == session['job_id']), None) if session['job_id'] else None
 

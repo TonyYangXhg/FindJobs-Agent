@@ -50,6 +50,39 @@ export async function simulateResumeUpload(file: File): Promise<UploadResumeResp
     body: form,
   });
 
+  // 异步受理：202 + task_id，轮询直到 completed/failed
+  if (response.status === 202) {
+    const accepted = await response.json();
+    const taskId = accepted?.task_id;
+    if (!taskId) {
+      throw new Error('Upload accepted but missing task_id');
+    }
+
+    const started = Date.now();
+    const timeoutMs = 5 * 60 * 1000;
+    while (Date.now() - started < timeoutMs) {
+      const taskResp = await fetch(`${API_BASE}/resume/task/${taskId}`);
+      const task = await readJson<{
+        status: string;
+        error?: string;
+        resume?: Resume;
+        skills?: ResumeSkill[];
+      }>(taskResp);
+
+      if (task.status === 'completed' && task.resume) {
+        return {
+          resume: task.resume,
+          skills: task.skills || [],
+        };
+      }
+      if (task.status === 'failed') {
+        throw new Error(task.error || 'Resume parse failed');
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error('Resume parse timed out');
+  }
+
   return readJson<UploadResumeResponse>(response);
 }
 
