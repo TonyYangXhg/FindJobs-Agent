@@ -350,16 +350,16 @@ export default function InterviewPage({ job, onBack }: InterviewPageProps) {
                   onKeyPress={handleKeyPress}
                   placeholder="输入您的回答..."
                   disabled={isLoading}
-                  rows={1}
-                  className="flex-1 resize-none border border-gray-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-50"
-                  style={{ minHeight: '48px', maxHeight: '120px' }}
+                  rows={4}
+                  className="flex-1 resize-y border border-gray-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-50"
+                  style={{ minHeight: '96px', maxHeight: '320px' }}
                 />
                 <button onClick={sendMessage} disabled={!inputValue.trim() || isLoading}
                   className="px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0">
                   <Send className="w-5 h-5" />
                 </button>
               </div>
-              <p className="text-xs text-gray-500 mt-2">按 Enter 发送，Shift + Enter 换行</p>
+              <p className="text-xs text-gray-500 mt-2">按 Enter 发送，Shift + Enter 换行；可拖拽右下角拉大输入框</p>
             </div>
           </div>
         )}
