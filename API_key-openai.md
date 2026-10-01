@@ -6,4 +6,4 @@
 #   备注名 sk-xxxxxxxx
 
 # deepseek
-sk-168501de69f2439abca785f0870c31cc
+sk-*************
